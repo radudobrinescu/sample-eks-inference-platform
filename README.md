@@ -22,8 +22,6 @@ templates, so you get production-grade serving from a short spec instead of deep
 
 ## Architecture
 
-**Stack at a glance:** Amazon EKS (ArgoCD · KRO) · AWS ALB · Karpenter · vLLM · LiteLLM · Open WebUI · Langfuse - with an optional **llm-d + Gateway API Inference Extension** scale tier.
-
 Baseline EKS Cluster via terraform as per [Automated Provisioning of Application-Ready Amazon EKS Clusters](https://github.com/aws-solutions-library-samples/guidance-for-automated-provisioning-of-application-ready-amazon-eks-clusters) solution.
 
 ![Architecture](docs/img/architecture.png)
@@ -122,9 +120,16 @@ cd terraform/00.global/vars && cp example.tfvars dev.tfvars
 ./platformctl up dev
 ```
 
+> **Working from a new IP or location?** The EKS API is public but locked to an
+> allowlist (`cluster_endpoint_public_access_cidrs`), and `kubectl`, `platformctl
+> tunnel` and `new-model` all need it. Run `./platformctl allow-ip` to point it at your
+> current IP in one step (`--keep` adds it to the existing list). It updates the cluster,
+> syncs your tfvars, and checks `kubectl` works. The UIs themselves need nothing (internal
+> ALB + SSM tunnel).
+
 4. Test - no GPUs yet (up already pointed kubectl at the new cluster)
 ```bash
-./platformctl tunnel        # forward the UIs (WebUI / LiteLLM / Langfuse / Grafana / ArgoCD)
+./platformctl tunnel        # forward the UIs (WebUI / LiteLLM / Langfuse / Dashboard / ArgoCD)
 ./platformctl status --check  # verify the platform is healthy + Langfuse tracing works (no models answer yet - you enroll them next)
 ```
 
@@ -255,8 +260,8 @@ version falling behind *between* applies, a weekly **report-only** GitHub Action
 ([`.github/workflows/addon-freshness.yaml`](.github/workflows/addon-freshness.yaml))
 checks each managed addon against the newest available and opens a GitHub issue with
 the exact `update-addon` commands when any is behind - it never mutates the cluster.
-It's scoped to EKS **managed addons only**; OSS components (LiteLLM, Open WebUI,
-Langfuse, etc.) stay operator-pinned. Enable it by setting the `ADDON_RECONCILER_*`
+It's scoped to EKS **managed addons only**; the other components (LiteLLM, Open WebUI,
+Langfuse, etc.) are pinned, and move with the platform's releases (see [Upgrading](#upgrading)). Enable it by setting the `ADDON_RECONCILER_*`
 repo variables (see the workflow header).
 
 **Team self-service (GitOps).** Onboard a team with an `AITeam` YAML in
@@ -304,6 +309,26 @@ See **[docs/cloudfront-edge.md](docs/cloudfront-edge.md)** for how it works and 
 edge gotchas the Terraform handles.
 
 ---
+
+## Upgrading
+
+The platform is released as tagged versions (`vYYYY.MM.N`). A release is a set of
+component versions that was installed from scratch and upgraded from the previous
+release on real clusters before it was tagged; the sets are listed in
+[docs/validated-versions.md](docs/validated-versions.md), and each release has notes
+under [docs/releases/](docs/releases/) saying what changed and what, if anything, to do
+first.
+
+To move an existing environment to the newest release:
+
+```bash
+git remote add upstream <url of the repository you forked from>   # once
+./platformctl upgrade <env>
+```
+
+It fetches the releases, applies them one at a time (Terraform first, then your
+GitOps branch) and checks the platform after each. `--plan-only` shows what the next
+release would change. See [UPGRADING.md](UPGRADING.md).
 
 ## Cleanup
 
@@ -355,10 +380,13 @@ platform/
   services/         litellm, litellm-sync, open-webui, langfuse, gpu-operator,
                     cluster-dashboard (+ Platform Health Agent), inference-gateway
 workloads/          Self-service YAMLs: models/ · scale-models/ · teams/
-platformctl         The unified CLI (use · up · status · tunnel · edge · new-model · onboard-team · down · list-envs)
+platformctl         The unified CLI (use · up · status · tunnel · allow-ip · edge · new-model · onboard-team · upgrade · down · list-envs)
 ops/                platformctl implementation: ops/lib/ (helpers) · ops/image/ (cold-start build helpers)
 terraform/          Infrastructure modules (VPC → IAM → EKS → observability)
-docs/               cloudfront-edge
+releases/           One manifest per release, read by ./platformctl upgrade
+docs/               cloudfront-edge · validated-versions · releases/ (notes per release)
+tests/              Unit tests for platformctl, the ops helpers and repo-wide guards
+UPGRADING.md        How to upgrade an environment to a newer release
 .github/workflows/  ci (pre-merge validation) · addon-freshness (weekly report-only EKS-addon drift check)
 ```
 

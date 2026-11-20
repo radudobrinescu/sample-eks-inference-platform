@@ -343,7 +343,7 @@ def build_remediator_job(investigation_id: str) -> dict:
                             "command": ["/bin/sh", "-c"],
                             "args": [
                                 "set -eu; pip install --no-cache-dir --target=/pydeps "
-                                "psycopg[binary]==3.2.3 awslabs.eks-mcp-server",
+                                "psycopg[binary]==3.3.9 awslabs.eks-mcp-server",
                             ],
                             "volumeMounts": [{"name": "pydeps", "mountPath": "/pydeps"}],
                             "securityContext": {"runAsNonRoot": True, "runAsUser": 65532,
@@ -1027,8 +1027,8 @@ def _dcgm_util() -> dict:
     return out
 
 
-def _bedrock_models() -> list:
-    """Declared Bedrock (config-defined) models from the litellm-config ConfigMap."""
+def _bedrock_models_from_config() -> list:
+    """Static Bedrock models declared in the litellm-config ConfigMap (none by default)."""
     if not HAVE_YAML:
         return []
     cm = k8s_get(f"/api/v1/namespaces/{LITELLM_NAMESPACE}/configmaps/{LITELLM_CONFIG_CM}")
@@ -1044,6 +1044,31 @@ def _bedrock_models() -> list:
         return out
     except Exception:
         return []
+
+
+def _bedrock_models_from_crs() -> list:
+    """Bedrock models enrolled as BedrockModel CRs (`platformctl new-model --source bedrock`).
+
+    litellm-sync registers these in LiteLLM through its API, so they never appear in
+    the litellm-config ConfigMap. Read the CRs (all namespaces) to list them."""
+    d = k8s_get("/apis/bedrock.ai-platform/v1alpha1/bedrockmodels")
+    out = []
+    for item in (d or {}).get("items", []):
+        spec = item.get("spec") or {}
+        name = spec.get("modelName") or (item.get("metadata") or {}).get("name", "")
+        if name:
+            out.append({"name": name, "model": str(spec.get("model", ""))})
+    return out
+
+
+def _bedrock_models() -> list:
+    """Declared Bedrock models: static litellm-config entries plus BedrockModel CRs.
+
+    De-duplicated by name (a CR wins over a same-named static entry)."""
+    merged = {m["name"]: m for m in _bedrock_models_from_config() if m.get("name")}
+    for m in _bedrock_models_from_crs():
+        merged[m["name"]] = m
+    return list(merged.values())
 
 
 # Karpenter/provisioning Warning reasons that explain a stuck GPU deploy.

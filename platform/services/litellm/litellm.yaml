@@ -28,7 +28,7 @@ spec:
       serviceAccountName: litellm
       containers:
         - name: litellm
-          image: litellm/litellm:v1.81.9-stable.patch.1
+          image: litellm/litellm:v1.108.10-lts
           args: ["--config", "/app/config.yaml"]
           ports:
             - containerPort: 4000
@@ -76,8 +76,9 @@ spec:
                   name: litellm-env
                   key: AWS_ENDPOINT_URL_BEDROCK_RUNTIME
                   optional: true
-            # Langfuse callback is enabled via litellm_settings.success_callback
-            # in the config (not an env var). These provide the credentials it uses.
+            # The Langfuse callback (langfuse_otel) is enabled via
+            # litellm_settings.success_callback in the config (not an env var).
+            # These provide the endpoint and credentials it uses.
             - name: LANGFUSE_HOST
               value: "http://langfuse-web.ai-platform.svc.cluster.local:3000"
             - name: LANGFUSE_PUBLIC_KEY
@@ -160,9 +161,13 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 15
           resources:
+            # Request sized to observed use on LiteLLM v1.83.14: 1.0-1.35Gi per
+            # replica at idle after boot + prisma migrate. With a 1Gi request the
+            # kubelet evicted a replica from a 4GiB node under memory pressure
+            # (found in testing on Kubernetes 1.37). The 2Gi limit is unchanged.
             requests:
               cpu: 500m
-              memory: 1Gi
+              memory: 1536Mi
             limits:
               cpu: "1"
               memory: 2Gi
@@ -202,9 +207,11 @@ data:
     litellm_settings:
       # Register the Langfuse callback HERE — this is the only place LiteLLM
       # reads it. (There is no LITELLM_CALLBACKS env var; setting one is a no-op.)
-      # With langfuse listed, LiteLLM picks up LANGFUSE_PUBLIC_KEY / SECRET_KEY /
-      # HOST from the env wired in the Deployment and traces every request.
-      success_callback: ["langfuse"]
+      # With langfuse_otel listed, LiteLLM picks up LANGFUSE_PUBLIC_KEY / SECRET_KEY /
+      # HOST from the env wired in the Deployment and traces every request over
+      # OpenTelemetry (<LANGFUSE_HOST>/api/public/otel). Not the older "langfuse"
+      # callback: it uses the Langfuse Python SDK v2, which Langfuse 4 rejects.
+      success_callback: ["langfuse_otel"]
       # Prometheus metrics (per-model request counters) power llm-d scale-to-zero.
       # LiteLLM is the front door: it sees every request BEFORE it reaches the
       # llm-d EPP, so its request counter increments even when the pool is scaled
@@ -287,7 +294,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: seed-budget
-          image: curlimages/curl:8.21.0
+          image: curlimages/curl:8.23.0
           env:
             - name: MASTER_KEY
               valueFrom:
@@ -362,7 +369,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16.14-alpine
+          image: postgres:16.16-alpine
           ports:
             - containerPort: 5432
           env:
@@ -535,7 +542,7 @@ spec:
           # pg_dumpall (superuser client) writes a gzip to the shared emptyDir…
           initContainers:
             - name: dump
-              image: postgres:16.14-alpine
+              image: postgres:16.16-alpine
               command: ["sh", "-c"]
               args:
                 - |
@@ -558,7 +565,7 @@ spec:
           # …then the aws-cli container uploads it to S3 and the emptyDir is discarded.
           containers:
             - name: upload
-              image: amazon/aws-cli:2.36.8
+              image: amazon/aws-cli:2.40.4
               command: ["sh", "-c"]
               args:
                 - |
@@ -583,3 +590,32 @@ spec:
           volumes:
             - name: backup
               emptyDir: {}
+---
+# litellm-sync (namespace inference) rolling-restarts this Deployment after it
+# removes the LAST DB-registered model: LiteLLM replicas do not evict that model
+# on their own (see _restart_litellm in litellm-sync). Scoped to this one
+# Deployment, get + patch only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: litellm-sync-restart
+  namespace: ai-platform
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["litellm"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: litellm-sync-restart
+  namespace: ai-platform
+subjects:
+  - kind: ServiceAccount
+    name: litellm-sync
+    namespace: inference
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: litellm-sync-restart

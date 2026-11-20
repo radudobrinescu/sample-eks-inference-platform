@@ -9,7 +9,7 @@ locals {
   # Single source of truth for the vLLM serving image version.
   # Surfaced to KRO via the platform-config ConfigMap (vllmImage); the
   # VLLMEndpoint RGD reads it via externalRef, falling back to its schema default.
-  vllm_image_tag = "v0.24.0"
+  vllm_image_tag = "v0.33.0"
   vllm_image     = "vllm/vllm-openai:${local.vllm_image_tag}"
 
   # HuggingFace model-weights cache.
@@ -17,7 +17,11 @@ locals {
   # worker's sidecar after first successful load (automatic). The initContainer
   # in the serving-tier RGDs (VLLMEndpoint/LLMDEndpoint/LLMDDisaggEndpoint) syncs
   # from here on pod startup — falling back to a live HF download on cache miss.
-  model_cache_bucket            = "${local.cluster_name}-model-cache"
+  # S3 bucket names are global, so "<cluster>-model-cache" collides with any other
+  # account using the same prefix/env (BucketAlreadyExists, 409). The account ID
+  # makes the name unique per account. Used for a new bucket only: an existing
+  # bucket keeps the name it was created with (see aws_s3_bucket.model_cache).
+  model_cache_bucket            = "${local.cluster_name}-${data.aws_caller_identity.current.account_id}-model-cache"
   inference_worker_sa_namespace = "inference"
   inference_worker_sa_name      = "inference-worker"
 
