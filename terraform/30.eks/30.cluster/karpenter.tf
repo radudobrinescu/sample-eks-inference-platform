@@ -83,7 +83,7 @@ resource "aws_iam_role_policy_attachment" "karpenter_node" {
 ################################################################################
 module "karpenter" {
   source  = "terraform-aws-modules/eks/aws//modules/karpenter"
-  version = "= 21.1.5"
+  version = "21.29.0"
 
   create = local.capabilities.autoscaling
 
@@ -91,33 +91,18 @@ module "karpenter" {
 
   create_pod_identity_association = true
 
-  # Additional controller permissions required by newer Karpenter versions that
-  # the pinned module (v21.1.5) does not yet grant:
-  #   - ec2:DescribeInstanceStatus  → required since Karpenter 1.12 for the
-  #     interruption controller's EC2 instance-status health checks.
-  #   - ec2:DescribePlacementGroups → required since Karpenter 1.11 for
-  #     placement-group support (harmless when unused; future-proofs the role).
-  #   - iam:ListInstanceProfiles    → required since Karpenter 1.7 for the
-  #     instance-profile controller/garbage-collection (does not support
-  #     resource-level scoping, so it must target "*").
-  #   - ec2:DescribeCapacityReservations → required for
-  #     capacityReservationSelectorTerms (ODCR / Capacity Block discovery for
-  #     gpu_capacity_reservation_ids; ReservedCapacity gate is on by default
-  #     since Karpenter 1.6). Harmless when no reservations are configured.
-  # All are read-only; consistent with the module's AllowRegionalReadActions.
-  iam_policy_statements = [
-    {
-      sid       = "AllowInstanceStatusAndPlacementGroupReads"
-      effect    = "Allow"
-      resources = ["*"]
-      actions = [
-        "ec2:DescribeInstanceStatus",
-        "ec2:DescribePlacementGroups",
-        "ec2:DescribeCapacityReservations",
-        "iam:ListInstanceProfiles",
-      ]
-    }
-  ]
+  # Inline controller policy. From module v21.29 the controller policy renders
+  # to ~6.2K characters, over the 6,144 limit for a managed IAM policy
+  # (CreatePolicy: "LimitExceeded: Cannot exceed quota for PolicySize: 6144",
+  # found in testing). An inline role policy allows 10,240; this is the
+  # module's documented remedy. On a LIVE cluster the apply swaps the managed
+  # policy for an inline one in the same run.
+  enable_inline_policy = true
+
+  # The four extra read-only actions earlier module versions lacked
+  # (ec2:DescribeInstanceStatus, ec2:DescribePlacementGroups,
+  # ec2:DescribeCapacityReservations, iam:ListInstanceProfiles) are granted by
+  # the module itself since v21.29, so no iam_policy_statements are needed.
 
   # Used to attach additional IAM policies to the Karpenter node IAM role.
   # ESC: the node role is created outside this module (see aws_iam_role.karpenter_node)
@@ -144,6 +129,49 @@ module "karpenter" {
 ################################################################################
 # Karpenter Helm chart deployment
 ################################################################################
+locals {
+  # One pin for the controller and its CRDs.
+  karpenter_chart_version = "1.15.2"
+}
+
+# Karpenter's CRDs, rendered from the same chart version and applied BEFORE the
+# chart. Helm installs a chart's crds/ only on the first install and never
+# updates them, so without this an upgraded cluster keeps the CRDs it was born
+# with (a v1.14-style CRD change would break the controller). Server-side apply
+# takes over the Helm-installed CRDs in place; apply_only means Terraform never
+# deletes a CRD (that would delete every NodePool/NodeClaim); they go with the
+# cluster on `down`.
+data "helm_template" "karpenter_crds" {
+  count = local.capabilities.autoscaling ? 1 : 0
+
+  name         = "karpenter"
+  namespace    = "kube-system"
+  repository   = "oci://public.ecr.aws/karpenter"
+  chart        = "karpenter"
+  version      = local.karpenter_chart_version
+  include_crds = true
+  set          = [{ name = "settings.clusterName", value = module.eks.cluster_name }]
+}
+
+resource "kubectl_manifest" "karpenter_crds" {
+  for_each = local.capabilities.autoscaling ? local.karpenter_crd_docs : {}
+
+  yaml_body         = each.value
+  server_side_apply = true
+  force_conflicts   = true
+  apply_only        = true
+
+  depends_on = [module.eks]
+}
+
+locals {
+  karpenter_crd_docs = local.capabilities.autoscaling ? {
+    for d in flatten([for f in data.helm_template.karpenter_crds[0].crds : split("\n---", f)]) :
+    yamldecode(d).metadata.name => d
+    if length(regexall("(?m)^kind:\\s*CustomResourceDefinition", d)) > 0
+  } : {}
+}
+
 resource "helm_release" "karpenter" {
   count = local.capabilities.autoscaling ? 1 : 0
 
@@ -151,17 +179,12 @@ resource "helm_release" "karpenter" {
   name       = "karpenter"
   repository = "oci://public.ecr.aws/karpenter"
   chart      = "karpenter"
-  # NOTE (CRDs): Helm does NOT upgrade CRDs bundled under the chart's `crds/`
-  # directory on `helm upgrade` — it only installs them on first `helm install`.
-  # Karpenter v1.14 moves the CapacityBuffer CRD to apiVersion v1beta1, so an
-  # in-place upgrade of a LIVE cluster requires the CRDs to be applied first
-  # (e.g. via the karpenter-crd chart / kubectl apply) BEFORE this release is
-  # upgraded. This only affects future/new clusters here, where the CRDs are
-  # installed fresh on the initial `helm install`, so no manual step is needed.
+  # CRDs: applied from the same chart version by kubectl_manifest.karpenter_crds
+  # above, before this release (Helm itself never upgrades a chart's crds/).
   # NOTE (DRA): Dynamic Resource Allocation is enabled by default in v1.14.
   # `IGNORE_DRA_REQUESTS` is the escape hatch to opt back out. It is harmless
   # for this cluster (no DRA-based scheduling in use), so left at the default.
-  version = "1.14.0"
+  version = local.karpenter_chart_version
   wait    = false
 
   values = [
@@ -192,7 +215,8 @@ resource "helm_release" "karpenter" {
   ]
 
   depends_on = [
-    module.karpenter
+    module.karpenter,
+    kubectl_manifest.karpenter_crds,
   ]
 }
 ################################################################################
@@ -203,8 +227,8 @@ resource "helm_release" "karpenter" {
 locals {
   # --- GPU capacity reservations (ODCRs / Capacity Blocks) -------------------
   # Rendered as a complete YAML block for the gpu-inference EC2NodeClass when
-  # reservations are configured, or an empty string (→ blank line) when not —
-  # same pattern as gpu_snapshot_id_line. The placeholder sits at the NodeClass
+  # reservations are configured, or an empty string (→ blank line) when not.
+  # The placeholder sits at the NodeClass
   # spec indent (2 spaces); continuation lines carry their own indent.
   gpu_capacity_reservation_selector = length(var.gpu_capacity_reservation_ids) == 0 ? "" : join("\n", concat(
     ["capacityReservationSelectorTerms:"],
@@ -214,6 +238,20 @@ locals {
   # the NodeClass actually selects reservations (Karpenter rejects it
   # otherwise); when present, Karpenter prioritizes reserved capacity before
   # falling back to on-demand/spot.
+  # Instance families the GPU NodePools refuse. g7 (RTX PRO 4500 Blackwell) needs
+  # NVIDIA driver 595, which the Bottlerocket NVIDIA AMIs ship for Kubernetes 1.37
+  # and later only; on 1.36 a g7 node joins but its GPU never comes up, so it is
+  # refused there (g7e uses driver 580 and runs on every version). See
+  # docs.aws.amazon.com/eks/latest/userguide/ml-eks-optimized-ami.html.
+  # ops/lib/recommend_instance/catalog.py mirrors these lists.
+  gpu_needs_driver_595                 = ["g7"]
+  gpu_driver_595_ok                    = tonumber(split(".", local.cluster_version)[1]) >= 37
+  gpu_inference_excluded_families_base = ["g4dn", "g4ad", "p3", "p3dn", "p2"]
+  gpu_shared_excluded_families_base    = ["g4dn", "g4ad"]
+  gpu_refused_for_driver               = local.gpu_driver_595_ok ? [] : local.gpu_needs_driver_595
+  gpu_inference_excluded_families      = jsonencode(concat(local.gpu_inference_excluded_families_base, local.gpu_refused_for_driver))
+  gpu_shared_excluded_families         = jsonencode(concat(local.gpu_shared_excluded_families_base, local.gpu_refused_for_driver))
+
   gpu_capacity_types = join(", ", [
     for t in concat(
       length(var.gpu_capacity_reservation_ids) > 0 ? ["reserved"] : [],
@@ -221,10 +259,11 @@ locals {
     ) : format("%q", t)
   ])
 
-  # GPU data volume size — the baked image snapshot's size by default, or the
-  # operator override for very large models (weights land on this volume via
-  # the hf-cache emptyDir; Kimi-K3-class checkpoints need ~2 TiB).
-  gpu_node_volume_gib = var.gpu_node_volume_size_gib > 0 ? var.gpu_node_volume_size_gib : local.snapshot_volume_gib
+  # GPU data volume size — 200 GiB by default (container images and the model
+  # weights), or the operator override for very large models (weights land on
+  # this volume via the hf-cache emptyDir; Kimi-K3-class checkpoints need ~2 TiB).
+  gpu_node_volume_default_gib = 200
+  gpu_node_volume_gib         = var.gpu_node_volume_size_gib > 0 ? var.gpu_node_volume_size_gib : local.gpu_node_volume_default_gib
 }
 
 data "kubectl_path_documents" "karpenter_manifests" {
@@ -234,17 +273,14 @@ data "kubectl_path_documents" "karpenter_manifests" {
     role         = local.capabilities.autoscaling ? aws_iam_role.karpenter_node[0].name : "KarpenterNodeInstanceProfile-${local.cluster_name}"
     cluster_name = local.cluster_name
     environment  = terraform.workspace
-    # Renders as a complete YAML line when set, or empty string when not.
-    # This avoids passing an invalid empty snapshotID to Karpenter.
-    # Source: explicit tfvar override > auto-discovered snapshot > disabled.
-    gpu_snapshot_id_line = local.resolved_snapshot_id != "" ? "snapshotID: ${local.resolved_snapshot_id}" : ""
-    # GPU data volume size — must be >= the baked snapshot's volume size.
-    # Kept in sync with local.snapshot_volume_gib (overridable via
-    # gpu_node_volume_size_gib for very large models).
+    # GPU data volume size (overridable via gpu_node_volume_size_gib for very
+    # large models).
     gpu_volume_size = local.gpu_node_volume_gib
     # Capacity Blocks / ODCRs for GPU inference nodes (empty = disabled).
     gpu_capacity_reservation_selector = local.gpu_capacity_reservation_selector
     gpu_capacity_types                = local.gpu_capacity_types
+    gpu_inference_excluded_families   = local.gpu_inference_excluded_families
+    gpu_shared_excluded_families      = local.gpu_shared_excluded_families
   }
   depends_on = [
     module.eks
@@ -253,7 +289,7 @@ data "kubectl_path_documents" "karpenter_manifests" {
 
 # Count-stabilization workaround (kubectl provider issue #58). The real
 # kubectl_path_documents above interpolates values only known at apply
-# (module.karpenter role, resolved snapshot ID, ...), so its `.documents`
+# (module.karpenter role, ...), so its `.documents`
 # length is unknown at plan and can't drive the kubectl_manifest `count`. This
 # "dummy" renders the SAME files with empty vars: the document COUNT is
 # identical and plan-time-known, while the real content comes from the resource
@@ -267,15 +303,16 @@ data "kubectl_path_documents" "karpenter_manifests_dummy" {
   count   = (local.capabilities.autoscaling || local.eks_auto_mode) ? 1 : 0
   pattern = "${path.module}/karpenter/*.yaml"
   vars = {
-    role                 = ""
-    cluster_name         = ""
-    environment          = terraform.workspace
-    gpu_snapshot_id_line = ""
-    gpu_volume_size      = local.gpu_node_volume_gib
+    role            = ""
+    cluster_name    = ""
+    environment     = terraform.workspace
+    gpu_volume_size = local.gpu_node_volume_gib
     # Plan-time-known (pure function of tfvars) — same values as the real
     # block, but they only need to keep the document COUNT stable.
     gpu_capacity_reservation_selector = local.gpu_capacity_reservation_selector
     gpu_capacity_types                = local.gpu_capacity_types
+    gpu_inference_excluded_families   = local.gpu_inference_excluded_families
+    gpu_shared_excluded_families      = local.gpu_shared_excluded_families
   }
 }
 

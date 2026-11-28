@@ -4,9 +4,10 @@
 # Investigator Jobs. Single replica (informers + DB writes; no need
 # for HA yet — recovery is automatic via reconnect logic).
 #
-# Image strategy: python:3.12-slim base + initContainer that installs
-# python-kubernetes + psycopg into an emptyDir shared with the main
-# container. No custom image, matches cluster-dashboard pattern.
+# Image strategy: the python -slim base (the `image:` lines below) +
+# initContainer that installs python-kubernetes + psycopg into an emptyDir
+# shared with the main container. No custom image, matches cluster-dashboard
+# pattern.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -38,7 +39,7 @@ spec:
           # Idempotent DB provisioning. Runs on every pod restart but is
           # near-instant once the database + tables already exist.
           # Uses the same db_init.sh + ddl.sql from the scripts ConfigMap.
-          image: postgres:16.14-alpine
+          image: postgres:16.16-alpine
           command: ["/bin/sh", "/scripts/db_init.sh"]
           env:
             - name: DB_HOST
@@ -64,14 +65,14 @@ spec:
             runAsUser: 70                  # 'postgres' uid in postgres:16.14-alpine
             capabilities: { drop: ["ALL"] }
         - name: install-pydeps
-          image: python:3.12-slim
+          image: python:3.15-slim
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
               pip install --no-cache-dir --target=/pydeps \
-                  kubernetes==31.0.0 \
-                  psycopg[binary]==3.2.3
+                  kubernetes==37.0.3 \
+                  psycopg[binary]==3.3.9
           volumeMounts:
             - name: pydeps
               mountPath: /pydeps
@@ -82,11 +83,11 @@ spec:
             capabilities: { drop: ["ALL"] }
       containers:
         - name: watcher
-          image: python:3.12-slim
+          image: python:3.15-slim
           command: ["python3", "/scripts/event_watcher.py"]
           env:
             - name: PYTHONPATH
-              value: /pydeps
+              value: /pydeps:/opt/lib
             - name: PYTHONUNBUFFERED
               value: "1"
             # ConfigMap (everything in platform-health-agent-config)
@@ -172,6 +173,9 @@ spec:
             - name: pydeps
               mountPath: /pydeps
               readOnly: true
+            - name: pha-lib
+              mountPath: /opt/lib
+              readOnly: true
             - name: tmp
               mountPath: /tmp
           resources:
@@ -204,6 +208,19 @@ spec:
           configMap:
             name: platform-health-agent-scripts
             defaultMode: 0755
+        # The shared `pha` package, projected from its flat ConfigMap keys.
+        - name: pha-lib
+          configMap:
+            name: platform-health-agent-scripts
+            items:
+              - { key: pha____init__.py, path: pha/__init__.py }
+              - { key: pha__db.py, path: pha/db.py }
+              - { key: pha__health.py, path: pha/health.py }
+              - { key: pha__jobs.py, path: pha/jobs.py }
+              - { key: pha__log.py, path: pha/log.py }
+              - { key: pha__rbac.py, path: pha/rbac.py }
+              - { key: pha__triggers.py, path: pha/triggers.py }
+              - { key: pha__watch.py, path: pha/watch.py }
         - name: pydeps
           emptyDir: {}
         - name: tmp

@@ -19,6 +19,13 @@ spec:
     metadata:
       labels:
         app: litellm
+      annotations:
+        # LiteLLM reads litellm-config at start only. These are plain manifests,
+        # so nothing rolls the pods when the ConfigMap changes: raise this number
+        # in the same commit as any change to the settings in config.yaml below
+        # (comments do not count; tests/test_litellm_metrics_scrape.py records
+        # the config each revision stands for and fails otherwise).
+        ai-platform/config-revision: "2"
     spec:
       # ServiceAccount carries the Bedrock IRSA role when enable_bedrock=true
       # (annotation injected by Terraform). Without it, this is a plain SA with
@@ -28,7 +35,7 @@ spec:
       serviceAccountName: litellm
       containers:
         - name: litellm
-          image: litellm/litellm:v1.81.9-stable.patch.1
+          image: litellm/litellm:v1.108.10-lts
           args: ["--config", "/app/config.yaml"]
           ports:
             - containerPort: 4000
@@ -76,8 +83,9 @@ spec:
                   name: litellm-env
                   key: AWS_ENDPOINT_URL_BEDROCK_RUNTIME
                   optional: true
-            # Langfuse callback is enabled via litellm_settings.success_callback
-            # in the config (not an env var). These provide the credentials it uses.
+            # The Langfuse callback (langfuse_otel) is enabled via
+            # litellm_settings.success_callback in the config (not an env var).
+            # These provide the endpoint and credentials it uses.
             - name: LANGFUSE_HOST
               value: "http://langfuse-web.ai-platform.svc.cluster.local:3000"
             - name: LANGFUSE_PUBLIC_KEY
@@ -160,9 +168,13 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 15
           resources:
+            # Request sized to observed use on LiteLLM v1.83.14: 1.0-1.35Gi per
+            # replica at idle after boot + prisma migrate. With a 1Gi request the
+            # kubelet evicted a replica from a 4GiB node under memory pressure
+            # (found in testing on Kubernetes 1.37). The 2Gi limit is unchanged.
             requests:
               cpu: 500m
-              memory: 1Gi
+              memory: 1536Mi
             limits:
               cpu: "1"
               memory: 2Gi
@@ -202,30 +214,51 @@ data:
     litellm_settings:
       # Register the Langfuse callback HERE — this is the only place LiteLLM
       # reads it. (There is no LITELLM_CALLBACKS env var; setting one is a no-op.)
-      # With langfuse listed, LiteLLM picks up LANGFUSE_PUBLIC_KEY / SECRET_KEY /
-      # HOST from the env wired in the Deployment and traces every request.
-      success_callback: ["langfuse"]
-      # Prometheus metrics (per-model request counters) power llm-d scale-to-zero.
-      # LiteLLM is the front door: it sees every request BEFORE it reaches the
-      # llm-d EPP, so its request counter increments even when the pool is scaled
-      # to zero (the EPP 503s before it would count anything). The autoscaling
-      # Prometheus scrapes /metrics and KEDA uses the per-model arrival rate to
-      # wake a zero'd pool. `callbacks` applies to success AND failure, so a
-      # request that arrives while the pool is cold is still counted.
+      # With langfuse_otel listed, LiteLLM picks up LANGFUSE_PUBLIC_KEY / SECRET_KEY /
+      # HOST from the env wired in the Deployment and traces every request over
+      # OpenTelemetry (<LANGFUSE_HOST>/api/public/otel). Not the older "langfuse"
+      # callback: it uses the Langfuse Python SDK v2, which Langfuse 4 rejects.
+      success_callback: ["langfuse_otel"]
+      # Prometheus metrics (per-model request counters): the second wake signal
+      # for an llm-d model scaled to zero (the first is the request the llm-d
+      # router holds). LiteLLM is the front door: it counts every request BEFORE
+      # it reaches the router, so the counter moves even if the router could not
+      # hold it. The autoscaling Prometheus scrapes /metrics and KEDA uses the
+      # per-model arrival rate to wake a zero'd pool. `callbacks` applies to
+      # success AND failure, so a request that arrives while the pool is cold is
+      # still counted.
       callbacks: ["prometheus"]
+      # From the long-term-support line LiteLLM asks for a key on /metrics unless
+      # told otherwise. The autoscaling Prometheus scrapes it from inside the
+      # cluster without one (it runs in another namespace and holds no LiteLLM
+      # key), and with a key required the scrape answered 401: the request rate
+      # that wakes a zero'd pool never arrived.
+      # What this exposes: /metrics on port 4000 of every LiteLLM pod answers
+      # without a key. The load balancer does not forward that path
+      # (platform/config/ingress.yaml answers 404 itself), so it is not served
+      # through the gateway's URL. Inside the cluster nothing protects it: any
+      # workload that reaches the LiteLLM pods or Services can read it, team
+      # namespaces included (no NetworkPolicy limits port 4000). The metrics
+      # are usage figures (requests, tokens, spend, latency, remaining budget)
+      # labelled per model, per team, per key alias and per user. To close it,
+      # set this to true and give the autoscaling Prometheus a LiteLLM key for
+      # its scrape (platform/config/autoscaling-prometheus.yaml).
+      require_auth_for_metrics_endpoint: false
       # Per-user cost attribution: capture the identity Open WebUI forwards
       # (via ENABLE_FORWARD_USER_INFO_HEADERS) as spend tags, so spend reports
       # break down per user without issuing per-user API keys. Inert when the
       # headers are absent (e.g. direct API calls).
       extra_spend_tag_headers: ["x-openwebui-user-id", "x-openwebui-user-email"]
-      # Cold-start hold: when a pool is at zero, the request that triggers the
-      # wake-up retries while KEDA scales it up (Karpenter node + model load,
-      # ~1-2 min) — turning the cold start into added latency rather than an error.
+      # Defaults for every model. An llm-d model that scales to zero gets its own
+      # timeout and retry count from litellm-sync (the llm-d router holds its
+      # first request while the model starts; see platform/config/kro/llmd-endpoint.yaml).
       num_retries: 5
       request_timeout: 120
       # --- Per-user budgets & rate limits (self-service governance) ---
-      # 1a — Open WebUI chat path. Open WebUI authenticates to LiteLLM with the
-      # shared master key and forwards the signed-in identity as the
+      # 1a — Open WebUI chat path. Open WebUI authenticates to LiteLLM with one
+      # scoped, non-admin virtual key that all its users share (minted by the
+      # litellm-openwebui-key Job in platform/services/open-webui/open-webui.yaml;
+      # NOT the master key) and forwards the signed-in identity as the
       # x-openwebui-user-email header (see general_settings.user_header_mappings
       # below, which maps it to LiteLLM's "customer"/end-user). This applies a
       # per-person $ budget AND rpm/tpm throttle WITHOUT issuing per-user keys.
@@ -238,7 +271,7 @@ data:
       # 1b — direct API / virtual-key path. SSO users who sign in to the LiteLLM
       # UI are internal_users (role from custom:role — see GENERIC_USER_ROLE_ATTRIBUTE);
       # give them a default personal budget and cap any key they mint themselves.
-      # (Open WebUI traffic rides the master key, so these bound programmatic/API
+      # (Open WebUI traffic rides its one shared key, so these bound programmatic/API
       # use, not the chat path — that's what 1a above covers.) We deliberately do
       # NOT set default_internal_user_params.user_role here: role must stay driven
       # by custom:role, or the seed admin would be downgraded to internal_user.
@@ -287,7 +320,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: seed-budget
-          image: curlimages/curl:8.21.0
+          image: curlimages/curl:8.23.0
           env:
             - name: MASTER_KEY
               valueFrom:
@@ -331,6 +364,26 @@ spec:
       targetPort: 4000
       name: http
 ---
+# Headless twin of the Service above, for metrics only. Its DNS name answers
+# one A record per ready LiteLLM pod, so the autoscaling Prometheus
+# (platform/config/autoscaling-prometheus.yaml) scrapes each replica as its own
+# target: a counter lives in one process, and through the ClusterIP Service one
+# series took its samples from whichever replica answered. Clients, the ingress
+# and the tunnel keep using `litellm`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-metrics
+  namespace: ai-platform
+spec:
+  clusterIP: None
+  selector:
+    app: litellm
+  ports:
+    - port: 4000
+      targetPort: 4000
+      name: http
+---
 # Init script: creates additional databases on first PostgreSQL boot.
 # Runs via docker-entrypoint-initdb.d (only on empty data directory).
 apiVersion: v1
@@ -362,7 +415,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16.14-alpine
+          image: postgres:16.16-alpine
           ports:
             - containerPort: 5432
           env:
@@ -535,7 +588,7 @@ spec:
           # pg_dumpall (superuser client) writes a gzip to the shared emptyDir…
           initContainers:
             - name: dump
-              image: postgres:16.14-alpine
+              image: postgres:16.16-alpine
               command: ["sh", "-c"]
               args:
                 - |
@@ -558,7 +611,7 @@ spec:
           # …then the aws-cli container uploads it to S3 and the emptyDir is discarded.
           containers:
             - name: upload
-              image: amazon/aws-cli:2.36.8
+              image: amazon/aws-cli:2.40.4
               command: ["sh", "-c"]
               args:
                 - |
@@ -583,3 +636,32 @@ spec:
           volumes:
             - name: backup
               emptyDir: {}
+---
+# litellm-sync (namespace inference) rolling-restarts this Deployment after it
+# removes the LAST DB-registered model: LiteLLM replicas do not evict that model
+# on their own (see _restart_litellm in litellm-sync). Scoped to this one
+# Deployment, get + patch only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: litellm-sync-restart
+  namespace: ai-platform
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["litellm"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: litellm-sync-restart
+  namespace: ai-platform
+subjects:
+  - kind: ServiceAccount
+    name: litellm-sync
+    namespace: inference
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: litellm-sync-restart

@@ -9,7 +9,8 @@
 # replica — recovery is automatic (the watch re-lists current state on
 # reconnect and the reconcile loop repairs any drift).
 #
-# Image strategy: python:3.12-slim base + initContainer that pip-installs the
+# Image strategy: stock python slim image (the `image:` lines below) + an
+# initContainer that pip-installs the
 # kubernetes client into an emptyDir shared with the main container. No custom
 # image to build/push, matching the platform-health-agent event-watcher.
 ---
@@ -40,13 +41,13 @@ spec:
         kubernetes.io/arch: amd64
       initContainers:
         - name: install-pydeps
-          image: python:3.12-slim
+          image: python:3.15-slim
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
               pip install --no-cache-dir --target=/pydeps \
-                  kubernetes==31.0.0
+                  kubernetes==37.0.3
           volumeMounts:
             - name: pydeps
               mountPath: /pydeps
@@ -57,7 +58,7 @@ spec:
             capabilities: { drop: ["ALL"] }
       containers:
         - name: sync
-          image: python:3.12-slim
+          image: python:3.15-slim
           command: ["python3", "/scripts/litellm_sync.py"]
           env:
             - name: PYTHONPATH

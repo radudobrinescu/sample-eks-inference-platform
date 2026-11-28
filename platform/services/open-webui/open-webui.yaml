@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: open-webui
-          image: ghcr.io/open-webui/open-webui:v0.10.2
+          image: ghcr.io/open-webui/open-webui:v0.13.4
           ports:
             - containerPort: 8080
           env:
@@ -65,6 +65,14 @@ spec:
                   key: api-key
                   optional: true
             - name: WEBUI_AUTH
+              value: "true"
+            # Show every model Open WebUI's LiteLLM key can use to every signed-in
+            # user. Without this, Open WebUI hides models from non-admin users
+            # (role "user", e.g. ai-platform-developers) until an admin grants
+            # access per model in the UI, so newly enrolled models never appear
+            # for them. Model access control stays in LiteLLM (this key's model
+            # list, per-user budgets and spend tracking).
+            - name: BYPASS_MODEL_ACCESS_CONTROL
               value: "true"
             # --- SSO (Cognito OIDC) + per-user cost attribution ---
             # All secret refs are optional: until Terraform (enable_sso) creates
@@ -250,14 +258,16 @@ spec:
   template:
     metadata:
       labels:
-        app: open-webui
+        # Not `app: open-webui`: that is the Service's selector, and this pod
+        # would be an endpoint of the UI for as long as it runs.
+        app: litellm-openwebui-key
         ai-platform/job: openwebui-key
     spec:
       restartPolicy: OnFailure
       serviceAccountName: litellm-openwebui-key
       containers:
         - name: mint-key
-          image: alpine/k8s:1.35.6
+          image: alpine/k8s:1.37.2
           env:
             - name: MASTER_KEY
               valueFrom:

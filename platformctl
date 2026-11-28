@@ -6,9 +6,11 @@
 #   ./platformctl up      [ENV]        Provision everything (state backend + all Terraform stages)
 #   ./platformctl status  [ENV] [--check]  Show health + where the UIs are reachable; --check validates end-to-end
 #   ./platformctl tunnel  [ENV]        Reach the private UIs locally (SSM port-forward to the ClusterIPs)
+#   ./platformctl allow-ip [ENV] [--ip CIDR] [--keep]  Allow your current IP on the EKS API (run when your IP changes)
 #   ./platformctl edge    [MODE] [ENV] Choose the public front door: cloudfront | domain | tunnel
 #   ./platformctl new-model MODEL [..] Right-size a model + scaffold its serving YAML (VLLMEndpoint/LLMDEndpoint)
 #   ./platformctl onboard-team NAME [..] Scaffold an AITeam YAML (namespace + GPU quota + budget + scoped key) for a new team
+#   ./platformctl upgrade [ENV] [--to TAG] [--plan-only] [--yes] [--allow-replace ADDR]...  Upgrade to the newest release, one release at a time (see UPGRADING.md)
 #   ./platformctl down    [ENV] [--purge]  Tear down infra; --purge also deletes the env definition (tfvars + workspaces)
 #   ./platformctl list-envs            List configured environments (cluster + region; marks the active one)
 set -euo pipefail
@@ -24,7 +26,8 @@ NS_PLATFORM="ai-platform"
 STATE_DIR="${REPO_ROOT}/.platformctl"
 ACTIVE_ENV_FILE="${STATE_DIR}/active-env"
 
-# UI -> local tunnel port (matches ops/lib/tunnel.sh and the ALB listener ports).
+# UI -> local tunnel port (the ALB listener ports; ops/lib/tunnel.sh forwards
+# these and Argo CD on 8090).
 UI_PORTS=("Open WebUI:8080" "LiteLLM:4000" "Langfuse:3000" "Dashboard:9090")
 
 c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_red=$'\033[31m'; c_ylw=$'\033[33m'; c_rst=$'\033[0m'
@@ -76,12 +79,31 @@ resolve_env() {
 # nested in shared_config (grep by exact key name; both are simple "..." values).
 tfvar_region() { grep -E '^[[:space:]]*region[[:space:]]*=' "${TF_DIR}/00.global/vars/${1}.tfvars" 2>/dev/null | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/' || true; }
 tfvar_prefix() { grep -E '^[[:space:]]*resources_prefix[[:space:]]*=' "${TF_DIR}/00.global/vars/${1}.tfvars" 2>/dev/null | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/' || true; }
+tfvar_kubernetes_version() { grep -E '^[[:space:]]*kubernetes_version[[:space:]]*=' "${TF_DIR}/00.global/vars/${1}.tfvars" 2>/dev/null | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/'; }
 # Cluster name convention (locals.tf: "${resources_prefix}-${workspace}").
 cluster_of() { local p; p="$(tfvar_prefix "$1")"; echo "${p:+${p}-}$1"; }
 
 # Pin AWS_REGION from the env's tfvars so make + Terraform (via data.aws_region)
 # + kubeconfig all target the same region instead of ambient AWS config.
 pin_region() { local r; r="$(tfvar_region "${1}")"; [ -n "$r" ] && export AWS_REGION="$r" || true; }
+
+# True when the kubectl context named ENV points at CLUSTER (in AWS_REGION, when
+# set). `down` and `upgrade` act through that context, and its name alone proves
+# nothing: another fork's environment, or this one in another region, can own a
+# context with the same name. Compared exactly, so a sibling such as <cluster>2
+# never passes.
+_context_is_cluster() {
+  local env="$1" cluster="$2" target
+  target="$(kubectl config view -o jsonpath="{.contexts[?(@.name==\"${env}\")].context.cluster}" 2>/dev/null || true)"
+  case "$target" in
+    "$cluster") return 0 ;;
+    arn:*:cluster/"$cluster") ;;
+    *) return 1 ;;
+  esac
+  [ -n "${AWS_REGION:-}" ] || return 0
+  case "$target" in arn:*:eks:"${AWS_REGION}":*) return 0 ;; esac
+  return 1
+}
 
 # Warn (never switch — safest) when the current kubectl context is not the
 # resolved env's cluster. status/tunnel act on the CURRENT context.
@@ -117,12 +139,50 @@ edge_urls_live() {
 
 # ---- up / down ------------------------------------------------------------- #
 
+# EKS caps node_group_name_prefix at 37 characters, and Terraform names the
+# system node group "<cluster>-criticaladdons" (prefix "<that>-"). A longer env
+# name fails only after the VPC and the cluster are already created, so refuse
+# it up front.
+check_env_name_length() {
+  local env="$1" prefix cluster max
+  cluster="$(cluster_of "$env")"
+  prefix="${cluster}-criticaladdons-"
+  [ "${#prefix}" -le 37 ] && return 0
+  max=$(( 37 - ${#prefix} + ${#env} ))
+  die "env name '${env}' is too long: cluster '${cluster}' makes the node group prefix '${prefix}' ${#prefix} characters (EKS allows 37). Use at most ${max} characters for the env name."
+}
+
+# A fresh install records the release it was built from (see _release_marker_get),
+# so its first upgrade starts from the right one. Best-effort, and never over an
+# existing record: on an installed env only a completed `upgrade` moves it.
+_up_record_release() {
+  local env="$1" rel
+  command -v kubectl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || return 0
+  kubectl config get-contexts "$env" >/dev/null 2>&1 || return 0
+  [ -z "$(_release_marker_get "$env")" ] || return 0
+  # What Argo CD syncs (the branch upstream), not a release merged here and not pushed.
+  local rev='@{u}'
+  git -C "$REPO_ROOT" rev-parse -q --verify '@{u}' >/dev/null 2>&1 || rev=HEAD
+  rel="$(python3 "${LIB_DIR}/release_manifest.py" release-of --repo "$REPO_ROOT" --rev "$rev" 2>/dev/null || true)"
+  case "$rel" in baseline|v[0-9]*) ;; *) return 0 ;; esac
+  _release_marker_set "$env" "$rel" "$(git -C "$REPO_ROOT" rev-parse "$rev" 2>/dev/null || echo unknown)" || true
+}
+
 cmd_up() {
   local env; env=$(need_env "${1:-}" "up")
-  need terraform; need aws; need make; require_tfvars "$env"; check_tfvars_filled "$env"; pin_region "$env"
+  # kubectl: the release record below, and every command after `up`, use it.
+  need terraform; need aws; need make; need kubectl; require_tfvars "$env"; check_tfvars_filled "$env"; check_env_name_length "$env"; pin_region "$env"
   log "Provisioning '${env}' — EKS + capabilities + Karpenter (takes a while)"
-  make -C "$TF_DIR" bootstrap ENVIRONMENT="$env"
-  make -C "$TF_DIR" apply-all ENVIRONMENT="$env"
+  # Explicit checks: when cmd_up is invoked in a `||` context
+  # bash suppresses errexit inside the function, so a failed make would
+  # otherwise fall through to the "Done" banner and return 0.
+  make -C "$TF_DIR" bootstrap ENVIRONMENT="$env" || { warn "state backend bootstrap failed"; return 1; }
+  make -C "$TF_DIR" apply-all ENVIRONMENT="$env" || { warn "terraform apply failed (see above)"; return 1; }
+  # Terraform's own update-kubeconfig names the context after the cluster ARN.
+  # The release record, `status --check` and `upgrade` look for one named after
+  # the environment, so create it (and make this the active environment).
+  cmd_use "$env"
+  _up_record_release "$env"
   echo
   ok "Done. Next:"
   echo "  ./platformctl status --check     # confirm it's healthy AND working"
@@ -203,17 +263,60 @@ _delete_cluster_albs() {
 # One quiet, cluster-wide pass that clears the controller finalizers which hang
 # Terraform's namespace deletes once the owning controller is torn down:
 #   - elbv2.k8s.aws/resources on Ingresses + TargetGroupBindings (AWS LB Controller)
-#   - litellm.ai-platform/deregister on the kro serving/team CRs (litellm-sync)
+#   - litellm.ai-platform/deregister on the kro serving/team CRs and on
+#     BedrockModels (litellm-sync)
+#   - finalizer.keda.sh on ScaledObjects/ScaledJobs (KEDA). KEDA runs on
+#     Karpenter nodes, so once the drain removes them nothing can release a
+#     ScaledObject deleted later, and the llm-d model's namespace never
+#     finishes deleting (seen in testing: cluster left ACTIVE, `down` exit 1).
+#   - argocd.argoproj.io/hook-finalizer on Argo CD hook objects (PreSync and
+#     PostSync Jobs, Secrets, Pods). Argo CD removes it when the hook finishes;
+#     a hook still running when `down` removes Argo CD keeps it forever, and its
+#     namespace never finishes deleting (seen in testing: the litellm-enduser-budget
+#     PostSync Job held ai-platform Terminating, cluster left ACTIVE).
 # Safe: every one of these objects is being destroyed anyway.
+# Pods already being deleted on a node whose kubelet is gone never finish:
+# nothing confirms the deletion, so their namespace stays Terminating and
+# Terraform's namespace destroy times out ("context deadline exceeded"). This
+# happens when destroy removes Karpenter's NodePool and controller together:
+# the nodes' instances go, their Node objects stay (karpenter.sh/termination
+# finalizer). Force-delete only pods that are BOTH terminating AND on a node
+# whose Ready condition is not True; `down` is removing the cluster anyway.
+_force_delete_stranded_pods() {
+  local env="$1" dead ns name node
+  dead="$(kubectl --context "$env" --request-timeout=20s get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}' 2>/dev/null \
+    | awk '$2 != "True" {print $1}')" || return 0
+  [ -n "$dead" ] || return 0
+  kubectl --context "$env" --request-timeout=20s get pods -A \
+    -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' 2>/dev/null \
+    | while read -r ns name node; do
+        if [ -z "$node" ] || ! printf '%s\n' "$dead" | grep -qx "$node"; then continue; fi
+        kubectl --context "$env" --request-timeout=20s delete pod "$name" -n "$ns" --grace-period=0 --force >/dev/null 2>&1 \
+          && echo "  [watchdog] fallback: force-deleted pod ${ns}/${name} stranded on unreachable node ${node}"
+      done || true
+  return 0
+}
+
 _strip_teardown_finalizers() {
   local env="$1" kind r
-  for kind in ingress targetgroupbindings.elbv2.k8s.aws vllmendpoints.kro.run llmdendpoints.kro.run llmddisaggendpoints.kro.run aiteams.kro.run; do
+  for kind in ingress targetgroupbindings.elbv2.k8s.aws vllmendpoints.kro.run llmdendpoints.kro.run llmddisaggendpoints.kro.run aiteams.kro.run bedrockmodels.bedrock.ai-platform scaledobjects.keda.sh scaledjobs.keda.sh; do
     for r in $(kubectl --context "$env" get "$kind" -A \
         -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null); do
       [ -n "$r" ] || continue
       kubectl --context "$env" patch "$kind" "${r#*/}" -n "${r%%/*}" \
         --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
     done
+  done
+  # Argo CD hooks: only the objects that carry its hook finalizer.
+  for kind in jobs.batch pods secrets configmaps; do
+    { kubectl --context "$env" get "$kind" -A \
+        -o jsonpath='{range .items[?(@.metadata.finalizers)]}{.metadata.namespace}/{.metadata.name} {.metadata.finalizers}{"\n"}{end}' 2>/dev/null || true; } \
+      | awk '/argocd\.argoproj\.io\/hook-finalizer/ {print $1}' \
+      | while read -r r; do
+          kubectl --context "$env" patch "$kind" "${r#*/}" -n "${r%%/*}" \
+            --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        done
   done
 }
 
@@ -228,12 +331,246 @@ _strip_teardown_finalizers() {
 # finishes with no manual `kubectl patch` / ALB deletion. Runs quietly in the
 # background for the whole destroy; cmd_down kills it when destroy-all returns.
 _teardown_watchdog() {
+  # Best effort by design, and it runs as a background subshell of a
+  # `set -euo pipefail` script: one failing call (kubectl against a cluster that
+  # is being deleted) would otherwise kill it silently, and then nothing
+  # terminates the Karpenter nodes, so the subnet delete waits out its 20-minute
+  # timeout (seen in testing). Errors here never stop the loop.
+  set +e +o pipefail
   local env="$1" cluster="$2" vpc="$3" region="${AWS_REGION:-$(aws configure get region 2>/dev/null)}"
   while aws eks describe-cluster --name "$cluster" --region "$region" >/dev/null 2>&1; do
     _delete_cluster_albs "$cluster" "$vpc"
-    _strip_teardown_finalizers "$env"
+    if _context_is_cluster "$env" "$cluster"; then
+      _strip_teardown_finalizers "$env"
+      _force_delete_stranded_pods "$env"
+    fi
     sleep 8
   done
+  # Cluster is gone. Karpenter's controller went with it, so nothing will ever
+  # terminate the nodes it launched, and they pin the subnets: the networking
+  # destroy would otherwise wait out Terraform's 20-minute DeleteSubnet timeout
+  # before the post-failure sweep runs (seen on both test teardowns).
+  _terminate_karpenter_orphans "$vpc" "$region"
+  _delete_cluster_security_groups "$cluster" "$vpc" "$region"
+}
+
+# Security groups Terraform does not own that outlive the cluster and pin the
+# VPC: the EKS-created cluster SG (eks-cluster-sg-<cluster>-*) and the AWS Load
+# Balancer Controller's shared backend SG (k8s-traffic-<cluster sans dashes>-*).
+# Left behind, they held a VPC delete for 45 min. Name-scoped to this cluster
+# AND filtered to its VPC. Rules are revoked first because the two reference
+# each other.
+_delete_cluster_security_groups() {
+  local cluster="$1" vpc="$2" region="$3" compact sg sgs perms dir
+  [ -n "$vpc" ] || return 0
+  compact="${cluster//-/}"
+  # Instances terminated a moment ago still hold ENIs; give them time to detach.
+  sleep 60
+  sgs="$(aws ec2 describe-security-groups --region "$region" --filters "Name=vpc-id,Values=${vpc}" \
+    --query "SecurityGroups[?starts_with(GroupName, 'eks-cluster-sg-${cluster}-') || starts_with(GroupName, 'k8s-traffic-${compact}-')].GroupId" \
+    --output text 2>/dev/null || true)"
+  [ -n "$sgs" ] && [ "$sgs" != "None" ] || return 0
+  for sg in $sgs; do
+    for dir in ingress egress; do
+      perms="$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg" \
+        --query "SecurityGroups[0].$([ "$dir" = ingress ] && echo IpPermissions || echo IpPermissionsEgress)" --output json 2>/dev/null || echo '[]')"
+      [ "$perms" = "[]" ] || aws ec2 "revoke-security-group-${dir}" --region "$region" --group-id "$sg" --ip-permissions "$perms" >/dev/null 2>&1 || true
+    done
+  done
+  # Retry: an SG still referenced by a detaching ENI (or by the other SG's
+  # rules) fails with DependencyViolation. A single attempt deleted only one of
+  # the two, and the VPC delete then waited 20 minutes.
+  local left="$sgs" next _
+  for _ in $(seq 1 20); do
+    _delete_available_enis "$vpc" "$region" "$left"
+    next=""
+    for sg in $left; do
+      if aws ec2 delete-security-group --region "$region" --group-id "$sg" >/dev/null 2>&1; then
+        echo "  [watchdog] deleted leftover security group ${sg}"
+      elif aws ec2 describe-security-groups --region "$region" --group-ids "$sg" >/dev/null 2>&1; then
+        next="$next $sg"
+      fi
+    done
+    left="${next# }"
+    [ -n "$left" ] || return 0
+    sleep 30
+  done
+  echo "  [watchdog] could not delete security group(s) ${left}; the post-destroy sweep will retry"
+}
+
+# ENIs left "available" (detached, never deleted) in this VPC that still carry
+# one of the given security groups. They pin the SG, and through it the VPC.
+# Seen in testing: during the node drain the VPC CNI's delete of a node's secondary
+# ENI failed with "currently in use" and was never retried, so the ENI outlived
+# the node with the EKS cluster SG on it. Scoped to the VPC, the status and the
+# SGs, so an attached ENI or one without these SGs is never touched.
+_delete_available_enis() {
+  local vpc="$1" region="$2" sgs="$3" sg eni
+  [ -n "$vpc" ] && [ -n "$sgs" ] || return 0
+  for sg in $sgs; do
+    for eni in $(aws ec2 describe-network-interfaces --region "$region" \
+        --filters "Name=vpc-id,Values=${vpc}" "Name=status,Values=available" "Name=group-id,Values=${sg}" \
+        --query 'NetworkInterfaces[].NetworkInterfaceId' --output text 2>/dev/null || true); do
+      [ "$eni" = "None" ] && continue
+      aws ec2 delete-network-interface --region "$region" --network-interface-id "$eni" >/dev/null 2>&1 \
+        && echo "  [watchdog] deleted leftover network interface ${eni} (held ${sg})"
+    done
+  done
+  return 0
+}
+
+# Terminate instances Karpenter launched into this cluster's VPC. Scoped by
+# BOTH the VPC id and the karpenter.sh/nodepool tag, so nothing outside this
+# env (or not launched by Karpenter) is touched.
+_terminate_karpenter_orphans() {
+  local vpc="$1" region="$2" ids
+  [ -n "$vpc" ] || return 0
+  ids="$(aws ec2 describe-instances --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc}" "Name=tag-key,Values=karpenter.sh/nodepool" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || true)"
+  [ -n "$ids" ] && [ "$ids" != "None" ] || return 0
+  # shellcheck disable=SC2086
+  aws ec2 terminate-instances --region "$region" --instance-ids $ids >/dev/null 2>&1 || true
+  echo "  [watchdog] fallback: cluster gone; terminated orphaned Karpenter instance(s): ${ids}"
+}
+
+# Poll a probe until it reports done, gives up at a hard cap, or stops making
+# progress. The probe prints a short state signature (for example "3:41" for
+# 3 apps and 41 pods left) or nothing when done. A wait that keeps running
+# after the state stopped changing only costs time: in testing both teardown waits
+# below ran to their full 300 s cap in most runs, holding on objects that the
+# steps after them (finalizer stripping, the watchdog, forced termination)
+# clear anyway. Returns 0 when done, 1 on stall or cap; sets _WAIT_STATE to the
+# last signature and _WAIT_SECONDS to the time waited.
+_wait_progress() {
+  local probe="$1" cap="$2" stall="$3" interval="$4" waited=0 last="" since=0 cur
+  _WAIT_STATE="" _WAIT_SECONDS=0
+  while :; do
+    cur="$("$probe" 2>/dev/null)" || cur="?"
+    if [ -z "$cur" ]; then _WAIT_SECONDS=$waited; return 0; fi
+    _WAIT_STATE="$cur"
+    if [ "$cur" != "$last" ]; then last="$cur"; since=$waited
+    elif [ $((waited - since)) -ge "$stall" ]; then _WAIT_SECONDS=$waited; return 1; fi
+    if [ "$waited" -ge "$cap" ]; then _WAIT_SECONDS=$waited; return 1; fi
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+}
+
+_probe_argocd_apps() {
+  # Pods in namespaces Terraform (not Argo CD) owns stay until destroy; ignore them.
+  local keep='^(kube-system|kube-public|kube-node-lease|argocd|kro-system|keda|default)$' apps pods
+  apps="$(kubectl --context "$_PROBE_ENV" --request-timeout=20s get applications.argoproj.io -n argocd -o name 2>/dev/null)" || { echo "?"; return 0; }
+  [ -n "$apps" ] || return 0
+  pods="$(kubectl --context "$_PROBE_ENV" --request-timeout=20s get pods -A --no-headers \
+    -o custom-columns=NS:.metadata.namespace 2>/dev/null | grep -Evc "$keep")" || pods=0
+  echo "$(printf '%s\n' "$apps" | grep -c .) apps, ${pods} pods"
+}
+
+# Wait until the Argo CD Applications deleted above are gone. Their deletion
+# cascades to the workloads they own, so the pods that would hold a Karpenter
+# drain (PodDisruptionBudgets, do-not-disrupt) are removed while the nodes still
+# run. Stops after PLATFORMCTL_STALL_TIMEOUT (60 s) without progress or at
+# PLATFORMCTL_APPS_DELETE_TIMEOUT (300 s), and says what is left.
+_wait_argocd_apps_gone() {
+  local env="$1" interval="${PLATFORMCTL_KARPENTER_DRAIN_INTERVAL:-10}"
+  _PROBE_ENV="$env"
+  if _wait_progress _probe_argocd_apps "${PLATFORMCTL_APPS_DELETE_TIMEOUT:-300}" "${PLATFORMCTL_STALL_TIMEOUT:-60}" "$interval"; then
+    ok "Argo CD applications and their workloads are deleted (${_WAIT_SECONDS}s)."
+    return 0
+  fi
+  warn "Argo CD applications not gone after ${_WAIT_SECONDS}s (${_WAIT_STATE} left, no progress); continuing with the node drain."
+  kubectl --context "$env" --request-timeout=20s get applications.argoproj.io -n argocd \
+    -o jsonpath='{range .items[*]}  [drain] app {.metadata.name}: {.status.health.status}, finalizers {.metadata.finalizers}{"\n"}{end}' 2>/dev/null || true
+  return 0
+}
+
+# Let Karpenter remove its own nodes BEFORE Terraform runs. Terraform destroys
+# the NodePools and the Karpenter controller in the same apply, so the
+# controller is gone before it finishes terminating: the instances keep running
+# (they pin the subnets for Terraform's 20-minute timeout) and their Node
+# objects keep the karpenter.sh/termination finalizer (their pods then hold
+# namespaces in Terminating). Deleting the NodePools first, while Karpenter
+# still runs, makes it drain and terminate every node it launched. Bounded by
+# PLATFORMCTL_KARPENTER_DRAIN_TIMEOUT (default 300 s), then the instances of any
+# NodeClaims left are terminated (PLATFORMCTL_KARPENTER_FORCE_TIMEOUT, 300 s).
+# The drain wait also stops after PLATFORMCTL_STALL_TIMEOUT (60 s) without
+# progress: with every NodePool gone, pods that cannot be evicted never move;
+# after that the teardown watchdog's fallbacks still apply. Self-managed Karpenter only: under EKS Auto
+# Mode, AWS runs the controller and Terraform never removes it.
+_drain_karpenter_nodes() {
+  local env="$1" interval="${PLATFORMCTL_KARPENTER_DRAIN_INTERVAL:-10}"
+  local grace="${PLATFORMCTL_KARPENTER_DRAIN_TIMEOUT:-300}" force="${PLATFORMCTL_KARPENTER_FORCE_TIMEOUT:-300}"
+  local out ids
+  kubectl --context "$env" --request-timeout=20s get deployment karpenter -n kube-system >/dev/null 2>&1 || return 0
+  out="$(kubectl --context "$env" --request-timeout=20s get nodepools.karpenter.sh -o name 2>/dev/null)" || return 0
+  [ -n "$out" ] || return 0
+  log "Deleting Karpenter NodePools so Karpenter drains and terminates its own nodes while it still runs…"
+  kubectl --context "$env" --request-timeout=20s delete nodepools.karpenter.sh --all --wait=false >/dev/null 2>&1 || true
+  _PROBE_ENV="$env"
+  if _wait_progress _probe_karpenter_drain "$grace" "${PLATFORMCTL_STALL_TIMEOUT:-60}" "$interval"; then
+    ok "Karpenter terminated all of its nodes (${_WAIT_SECONDS}s)."; return 0
+  fi
+  # Drain stuck. With every NodePool gone there is nowhere to reschedule, so a
+  # PodDisruptionBudget whose other replica sits on another draining node can
+  # never be satisfied (seen in testing: one NodeClaim left after 600 s, both
+  # profiles). The cluster is being destroyed: terminate the instances behind
+  # the remaining NodeClaims; Karpenter, still running, sees them gone and
+  # removes the NodeClaims and Nodes itself.
+  _karpenter_drain_blockers "$env"
+  ids="$(kubectl --context "$env" --request-timeout=20s get nodeclaims.karpenter.sh \
+    -o jsonpath='{range .items[*]}{.status.providerID}{"\n"}{end}' 2>/dev/null | sed -n 's#.*/\(i-[0-9a-f]*\)$#\1#p' | tr '\n' ' ')" || ids=""
+  if [ -n "${ids// /}" ]; then
+    warn "Karpenter drain stopped progressing after ${_WAIT_SECONDS}s (${_WAIT_STATE} left); terminating the instances behind its remaining NodeClaims: ${ids}"
+    # shellcheck disable=SC2086
+    aws ec2 terminate-instances --region "${AWS_REGION:-}" --instance-ids $ids >/dev/null 2>&1 || true
+  fi
+  _karpenter_nodeclaims_gone "$env" "$force" "$interval" && { ok "Karpenter removed its remaining nodes after the instances were terminated."; return 0; }
+  warn "Karpenter NodeClaims remain; continuing. The teardown watchdog terminates leftovers once the cluster is gone (fallback)."
+  return 0
+}
+
+# True once no Karpenter NodeClaims remain; false after <timeout> seconds. An
+# unreadable list counts as "not yet".
+_karpenter_nodeclaims_gone() {
+  local env="$1" timeout="$2" interval="$3" waited=0 out
+  while :; do
+    if out="$(kubectl --context "$env" --request-timeout=20s get nodeclaims.karpenter.sh -o name 2>/dev/null)" && [ -z "$out" ]; then
+      return 0
+    fi
+    [ "$waited" -ge "$timeout" ] && return 1
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+}
+
+# Log what holds each remaining Karpenter node: its non-DaemonSet pods.
+# Drain state: NodeClaims left and the non-DaemonSet pods still on their nodes.
+# When neither number moves, only pods that cannot be evicted remain (no
+# NodePool is left to reschedule them), and waiting longer cannot help.
+_probe_karpenter_drain() {
+  local claims nodes pods=0 n
+  claims="$(kubectl --context "$_PROBE_ENV" --request-timeout=20s get nodeclaims.karpenter.sh -o name 2>/dev/null)" || { echo "?"; return 0; }
+  [ -n "$claims" ] || return 0
+  nodes="$(kubectl --context "$_PROBE_ENV" --request-timeout=20s get nodeclaims.karpenter.sh \
+    -o jsonpath='{range .items[*]}{.status.nodeName}{"\n"}{end}' 2>/dev/null)" || nodes=""
+  for n in $nodes; do
+    pods=$((pods + $(kubectl --context "$_PROBE_ENV" --request-timeout=20s get pods -A --field-selector "spec.nodeName=${n}" \
+      -o jsonpath='{range .items[?(@.metadata.ownerReferences[0].kind!="DaemonSet")]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -c . || true)))
+  done
+  echo "$(printf '%s\n' "$claims" | grep -c .) nodeclaims, ${pods} pods"
+}
+
+_karpenter_drain_blockers() {
+  local env="$1" node
+  for node in $(kubectl --context "$env" --request-timeout=20s get nodeclaims.karpenter.sh \
+      -o jsonpath='{range .items[*]}{.status.nodeName}{"\n"}{end}' 2>/dev/null); do
+    echo "  [drain] node ${node} still holds: $(kubectl --context "$env" --request-timeout=20s get pods -A \
+      --field-selector "spec.nodeName=${node}" \
+      -o jsonpath='{range .items[?(@.metadata.ownerReferences[0].kind!="DaemonSet")]}{.metadata.namespace}/{.metadata.name} {end}' 2>/dev/null)"
+  done
+  return 0
 }
 
 # Before Terraform runs, delete the in-cluster objects whose controllers create
@@ -248,6 +585,12 @@ _predown_drain() {
   local env="$1" cluster; cluster="$(cluster_of "$env")"
   command -v kubectl >/dev/null 2>&1 || { warn "kubectl not found — skipping in-cluster drain (destroy may fail on the ALB security group)."; return 0; }
   command -v aws >/dev/null 2>&1 && aws eks update-kubeconfig --name "$cluster" --region "${AWS_REGION:-}" --alias "$env" >/dev/null 2>&1 || true
+  # If that failed (the cluster is already gone, say), a context named '${env}'
+  # may still exist and belong to another cluster. Never drain that one.
+  if ! _context_is_cluster "$env" "$cluster"; then
+    warn "the kubectl context '${env}' does not point at cluster '${cluster}' — skipping in-cluster drain (Terraform will destroy what it can; sweep orphans afterward)."
+    return 0
+  fi
   if ! kubectl --context "$env" get namespace argocd >/dev/null 2>&1; then
     warn "cluster '${cluster}' not reachable — skipping in-cluster drain (Terraform will destroy what it can; sweep orphans afterward)."
     return 0
@@ -255,7 +598,7 @@ _predown_drain() {
   log "Draining in-cluster resources so their controllers release AWS resources (ALB, etc.)…"
   kubectl --context "$env" delete applicationset --all -n argocd --wait=false >/dev/null 2>&1 || true
   kubectl --context "$env" delete application --all -n argocd --wait=false >/dev/null 2>&1 || true
-  kubectl --context "$env" delete vllmendpoints,llmdendpoints,llmddisaggendpoints,aiteams --all -A --wait=false >/dev/null 2>&1 || true
+  kubectl --context "$env" delete vllmendpoints,llmdendpoints,llmddisaggendpoints,aiteams,bedrockmodels --all -A --wait=false >/dev/null 2>&1 || true
   kubectl --context "$env" delete ingress --all -A --wait=false >/dev/null 2>&1 || true
   # Deterministically remove the controller-managed ALB(s) too (best-effort here;
   # the teardown watchdog in cmd_down keeps doing this in a loop to beat the
@@ -271,6 +614,8 @@ _predown_drain() {
   # one-shot pass; the watchdog repeats it during destroy to beat re-adds.
   log "Clearing leftover controller finalizers so namespaces terminate cleanly during destroy…"
   _strip_teardown_finalizers "$env"
+  _wait_argocd_apps_gone "$env"
+  _drain_karpenter_nodes "$env"
   ok "In-cluster drain complete — controller AWS resources released and finalizers cleared."
 }
 
@@ -308,16 +653,27 @@ cmd_down() {
     _wd_pid=$!
     trap '[ -n "'"$_wd_pid"'" ] && kill "'"$_wd_pid"'" 2>/dev/null; trap - EXIT INT TERM' EXIT INT TERM
   fi
-  if ! make -C "$TF_DIR" destroy-all ENVIRONMENT="$env"; then
-    warn "Terraform destroy hit leftover dependencies — sweeping orphans and retrying once."
+  local destroyed=0
+  if make -C "$TF_DIR" destroy-all ENVIRONMENT="$env"; then
+    destroyed=1
+  else
+    warn "Terraform destroy hit leftover dependencies — sweeping orphans and retrying."
     _postdown_sweep "$env"
-    make -C "$TF_DIR" destroy-all ENVIRONMENT="$env" || warn "destroy still failing after the sweep — inspect the error above; re-running './platformctl down ${env}' is safe (idempotent)."
+    make -C "$TF_DIR" destroy-all ENVIRONMENT="$env" && destroyed=1
   fi
   # Stop the watchdog now that destroy has finished (cluster gone or given up).
   if [ -n "$_wd_pid" ]; then kill "$_wd_pid" 2>/dev/null || true; trap - EXIT INT TERM; fi
   # Final sweep: clear post-destroy orphans Terraform never manages so nothing
   # lingers billing (Karpenter instance-profiles, EKS KMS key + log groups, etc.).
   _postdown_sweep "$env"
+  # The final sweep can free what the second destroy waited on (an orphan ENI's
+  # security group, deleted only once the ENI was gone), so give Terraform one
+  # more try. Before, `down` stopped here, left the VPC and still exited 0.
+  if [ "$destroyed" -eq 0 ]; then
+    warn "Retrying destroy once more after the final sweep."
+    make -C "$TF_DIR" destroy-all ENVIRONMENT="$env" && destroyed=1 && _postdown_sweep "$env"
+  fi
+  [ "$destroyed" -eq 1 ] || die "destroy did not complete for '${env}' — inspect the errors above; resources may still exist (and bill). Re-running './platformctl down ${env}' is safe (idempotent)."
   [ "$purge" -eq 1 ] && purge_env_definition "$env"
   true
 }
@@ -432,7 +788,7 @@ _status_check() {
   else
     warn "No models registered in /v1/models yet — expected before you enroll one (not a failure). Add a self-hosted model with ./platformctl new-model, or a Bedrock model with ./platformctl new-model --source bedrock. Skipping the chat test."
   fi
-  if kubectl run pfcheck-langfuse --rm -i --restart=Never --image=curlimages/curl:8.11.0 -n "$NS_PLATFORM" --quiet -- \
+  if kubectl run pfcheck-langfuse --rm -i --restart=Never --image=curlimages/curl:8.23.0 -n "$NS_PLATFORM" --quiet -- \
        -fsS http://langfuse-web.ai-platform.svc.cluster.local:3000/api/public/health >/dev/null 2>&1; then
     ok "Langfuse tracing reachable"
   else
@@ -463,7 +819,136 @@ cmd_tunnel() {
   local env; env=$(resolve_env "${1:-}" 2>/dev/null || true)
   [ -n "$env" ] && pin_region "$env"   # tunnel.sh queries EC2 in AWS_REGION — target the env's region
   warn_context_mismatch "${1:-}"
+  # tunnel.sh resolves the service ClusterIPs with kubectl, which goes through the EKS
+  # public API endpoint — restricted to an IP allowlist. Fail fast with the fix.
+  [ "$(kubectl --request-timeout=8s get --raw /readyz 2>/dev/null)" = "ok" ] || \
+    die "cannot reach the cluster API with the current kubectl context — your IP is probably not allowlisted.
+  Fix:  ./platformctl allow-ip${env:+ ${env}}    (then re-run tunnel)"
   exec "${LIB_DIR}/tunnel.sh"
+}
+
+# ---- allow-ip -------------------------------------------------------------- #
+
+# Validate an IPv4 address or IPv4 CIDR and echo it in CIDR form (bare IP => /32).
+# Refuses /0 and anything that isn't plain IPv4 (EKS publicAccessCidrs is IPv4).
+_normalize_cidr() {
+  local c="$1" ip pfx o
+  case "$c" in */*) ip="${c%/*}"; pfx="${c#*/}" ;; *) ip="$c"; pfx=32 ;; esac
+  [[ "$pfx" =~ ^[0-9]+$ ]] || return 1
+  [ "$pfx" -ge 1 ] && [ "$pfx" -le 32 ] || return 1
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
+  echo "${ip}/${pfx}"
+}
+
+# Space-separated words -> unique, sorted, space-separated (order-insensitive compare).
+_uniq_sorted() { echo "$*" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd' ' -; }
+
+# Rewrite (or append) the cluster_endpoint_public_access_cidrs line in a tfvars file
+# so Terraform's view matches the live cluster. $2 is an HCL list, e.g. ["1.2.3.4/32"].
+_tfvars_set_cidrs() {
+  local f="$1" list="$2" tmp line
+  line="$(grep -E '^[[:space:]]*cluster_endpoint_public_access_cidrs[[:space:]]*=' "$f" | head -1 || true)"
+  if [ -n "$line" ]; then
+    case "$line" in *"]"*) ;; *) die "cluster_endpoint_public_access_cidrs in ${f#"$REPO_ROOT"/} spans several lines — edit it by hand to: ${list}" ;; esac
+  fi
+  tmp="$(mktemp)"
+  if [ -n "$line" ]; then
+    awk -v v="$list" '/^[[:space:]]*cluster_endpoint_public_access_cidrs[[:space:]]*=/ && !done { print "cluster_endpoint_public_access_cidrs = " v; done=1; next } { print }' "$f" > "$tmp"
+  else
+    { cat "$f"; printf '\ncluster_endpoint_public_access_cidrs = %s\n' "$list"; } > "$tmp"
+  fi
+  cat "$tmp" > "$f"; rm -f "$tmp"
+}
+
+# Point the EKS public API allowlist at the operator's CURRENT IP (or the --ip given)
+# in one step: updates the live cluster, waits for it, syncs <env>.tfvars so the next
+# `up` doesn't revert it, and confirms kubectl can reach the API. The UIs need nothing:
+# the ALB is internal and the SSM tunnel doesn't use this allowlist.
+cmd_allow_ip() {
+  need aws; need curl
+  local env_arg="" keep=0 dry=0 given=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep)    keep=1 ;;
+      --dry-run) dry=1 ;;
+      --ip)      shift; [ $# -gt 0 ] || die "--ip needs a value (IPv4 or CIDR)"; given="${given:+${given} }$1" ;;
+      -h|--help) echo "usage: platformctl allow-ip [ENV] [--ip IP|CIDR]... [--keep] [--dry-run]
+  Default: replace the EKS API allowlist with your current public IP (/32).
+  --ip     allow this IPv4/CIDR instead of auto-detecting (repeatable)
+  --keep   ADD to the existing allowlist instead of replacing it (e.g. two locations)
+  --dry-run  show what would change, change nothing"; return 0 ;;
+      -*)        die "unknown flag: $1 (see: ./platformctl allow-ip --help)" ;;
+      *)         env_arg="$1" ;;
+    esac
+    shift
+  done
+
+  local env; env=$(need_env "$env_arg" "allow-ip")
+  require_tfvars "$env"; pin_region "$env"
+  local region cluster tfvars; region="${AWS_REGION:-$(tfvar_region "$env")}"; cluster="$(cluster_of "$env")"
+  tfvars="${TF_DIR}/00.global/vars/${env}.tfvars"
+
+  if [ -z "$given" ]; then
+    given="$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')" \
+      || die "could not detect your public IP — pass it explicitly:  ./platformctl allow-ip --ip <a.b.c.d>"
+    [ -n "$given" ] || die "could not detect your public IP — pass it explicitly:  ./platformctl allow-ip --ip <a.b.c.d>"
+  fi
+  local want="" c n
+  for c in $given; do
+    n="$(_normalize_cidr "$c")" || die "'${c}' is not a valid IPv4/CIDR (and /0 is refused — never expose the API to the internet)."
+    want="${want:+${want} }${n}"
+  done
+
+  local current final
+  current="$(aws eks describe-cluster --name "$cluster" --region "$region" \
+    --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output text 2>/dev/null | tr '\t' ' ')" \
+    || die "cluster '${cluster}' not found in ${region} (provision it with './platformctl up ${env}' first)."
+  if [ "$keep" -eq 1 ]; then final="$(_uniq_sorted "$current $want")"; else final="$(_uniq_sorted "$want")"; fi
+
+  log "EKS API allowlist for '${cluster}' (${region})"
+  echo "  current: ${current:-<none>}"
+  echo "  new:     ${final}"
+  [ "$dry" -eq 0 ] || { warn "dry-run — nothing changed."; return 0; }
+
+  local hcl="" w
+  for w in $final; do hcl="${hcl:+${hcl}, }\"${w}\""; done
+  hcl="[${hcl}]"
+
+  if [ "$(_uniq_sorted "$current")" = "$final" ]; then
+    ok "cluster already allows exactly this — no AWS change needed."
+  else
+    local upd
+    if ! upd="$(aws eks update-cluster-config --name "$cluster" --region "$region" \
+          --resources-vpc-config "publicAccessCidrs=${final// /,}" --query 'update.id' --output text 2>&1)"; then
+      case "$upd" in *"No changes needed"*) upd="" ;; *) die "update-cluster-config failed: ${upd}" ;; esac
+    fi
+    if [ -n "$upd" ]; then
+      log "Applying (usually 1–2 min)…"
+      local st="Unknown"
+      for _ in $(seq 1 60); do
+        st="$(aws eks describe-update --name "$cluster" --region "$region" --update-id "$upd" \
+              --query 'update.status' --output text 2>/dev/null || echo Unknown)"
+        case "$st" in Successful) break ;; Failed|Cancelled) die "EKS update ${upd} ${st} — check: aws eks describe-update --name ${cluster} --update-id ${upd}" ;; esac
+        sleep 10
+      done
+      [ "$st" = "Successful" ] || die "timed out waiting for EKS update ${upd} (last status: ${st})."
+      ok "cluster allowlist updated."
+    fi
+  fi
+
+  _tfvars_set_cidrs "$tfvars" "$hcl"
+  ok "synced ${tfvars#"$REPO_ROOT"/} (so the next 'up' keeps it)"
+
+  aws eks update-kubeconfig --name "$cluster" --region "$region" --alias "$env" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6; do
+    if kubectl --context "$env" --request-timeout=10s get --raw /readyz >/dev/null 2>&1; then
+      ok "kubectl can reach the cluster API. Next: ./platformctl tunnel ${env}"
+      return 0
+    fi
+    sleep 5
+  done
+  warn "allowlist updated, but kubectl still can't reach the API from here yet (propagation can take a minute). Retry shortly; check your IP: curl https://checkip.amazonaws.com"
 }
 
 # ---- edge ------------------------------------------------------------------ #
@@ -546,7 +1031,9 @@ so edit + commit + push in your fork — there is no Terraform toggle:
        alb.ingress.kubernetes.io/scheme: internet-facing
        alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": <port>}]'
        alb.ingress.kubernetes.io/certificate-arn: <your ACM cert ARN, in this region>
-     and set inbound-cidrs to your own IP/CIDR ranges (never 0.0.0.0/0).
+     and limit the ALB's inbound security group (ai-platform-alb-inbound, in
+     terraform/30.eks/30.cluster/alb-security-group.tf) to your own IP/CIDR
+     ranges (never 0.0.0.0/0).
   2. Point your DNS (Route53 alias / CNAME) at the ALB hostname.
   3. Put your domain URLs in sso_public_urls in your tfvars and re-apply the
      cluster stage to wire the Cognito callbacks (a normal 'up' does this).
@@ -584,6 +1071,13 @@ cmd_new_model() {
   need python3
   [ "$#" -ge 1 ] || die "usage: platformctl new-model <hf-model-id> [flags]
   e.g. platformctl new-model Qwen/Qwen2.5-3B-Instruct --seq 8192 --users 4"
+  # The cluster's Kubernetes version decides which GPU families its NodePools
+  # admit (g7 needs 1.37), so the sizing offers only what Karpenter can launch.
+  local env version
+  if [ -z "${PLATFORM_KUBERNETES_VERSION:-}" ] && env="$(resolve_env "" 2>/dev/null)"; then
+    version="$(tfvar_kubernetes_version "$env")"
+    [ -z "$version" ] || export PLATFORM_KUBERNETES_VERSION="$version"
+  fi
   exec python3 "${LIB_DIR}/recommend-instance.py" "$@"
 }
 
@@ -592,8 +1086,8 @@ cmd_new_model() {
 # Scaffold an AITeam manifest into workloads/teams/<name>.yaml — the GitOps
 # self-service path for onboarding a team (creates a team-<name> namespace with a
 # GPU quota, RBAC, namespace isolation, and a scoped LiteLLM key). Mirrors
-# new-model: without --deploy it writes the file locally + prints it for review
-# (nothing pushed); with --deploy it also git-commits + pushes so ArgoCD applies
+# new-model: without --deploy it prints the manifest for review (nothing is
+# written or pushed); with --deploy it writes the file, commits and pushes so ArgoCD applies
 # it. Input is validated against the AITeam schema (platform/config/kro/
 # team-onboarding.yaml) so bad values are caught here, not deep in the onboarding
 # Job. This is a workloads-layer change only — it never touches infra or OSS
@@ -604,7 +1098,9 @@ cmd_onboard_team() {
   e.g. platformctl onboard-team search --gpu 4 --budget 500 --models qwen3-3b,claude-opus-4-8 --deploy
   flags: --models a,b (default *)  --budget USD (100.0)  --budget-duration 30d
          --rpm 100  --tpm 100000  --cpu 4  --memory 8Gi  --gpu 0
-         --langfuse-secret NAME  --deploy  -y  --force"
+         --langfuse-secret NAME  --deploy  -y  --force
+  --langfuse-secret routes the team's traces to its own Langfuse project; LiteLLM
+  documents per-team logging as an Enterprise feature (THIRD-PARTY-LICENSES)."
 
   # Schema: teamName is ALSO the team-<name> namespace, so it must be a DNS-1123
   # label (<=40 chars) — reject here instead of failing namespace creation later.
@@ -703,13 +1199,407 @@ EOF
     warn "About to git commit + push '${out#"$REPO_ROOT"/}' to branch '${branch}'."
     echo "    Pushing to the GitOps branch triggers ArgoCD to onboard team '${team}' (creates its namespace, quota, and LiteLLM key)."
     read -r -p "Proceed with commit + push? Type 'yes' to continue (anything else = write only, no push): " go
-    [ "$go" = "yes" ] || { warn "Left the file staged locally, nothing pushed. Commit it yourself when ready."; return 0; }
+    [ "$go" = "yes" ] || { warn "The file is written but not committed, and nothing is pushed. Commit it yourself when ready."; return 0; }
   fi
   git -C "$REPO_ROOT" add "$out"
   git -C "$REPO_ROOT" commit -m "Onboard team '${team}' (AITeam: gpu=${gpu}, budget=${budget}/${dur})" >/dev/null \
     || { warn "nothing to commit (file unchanged) — skipping push."; return 0; }
   git -C "$REPO_ROOT" push
   ok "pushed. ArgoCD will onboard team '${team}'. Watch it: kubectl get aiteams -n ai-platform -w"
+}
+
+# ---- upgrade --------------------------------------------------------------- #
+
+# Upgrade an env to a newer release (see UPGRADING.md), one release at a time.
+#
+# When no release is merged yet, upgrade fetches the release tags from the
+# repository this one was forked from (remote UPGRADE_REMOTE), merges the NEXT
+# release locally (not pushed) and starts the merged platformctl again, so each
+# release is applied by its own code. It repeats until the newest release (or
+# --to TAG). A forker may also merge a release tag by hand first; then only
+# that release is applied.
+#
+# Order matters within a release: Terraform first, push last. Argo CD
+# auto-syncs with prune + selfHeal, so pushing first would roll out chart and
+# manifest changes before the IAM/CRD/ConfigMap changes Terraform makes for them.
+UPGRADE_CONVERGE_TIMEOUT="${UPGRADE_CONVERGE_TIMEOUT:-1800}"   # seconds (30 min)
+UPGRADE_REMOTE="${UPGRADE_REMOTE:-upstream}"                   # git remote that publishes the release tags
+RELEASE_MARKER="platform-release"                              # ConfigMap in $NS_PLATFORM (see below)
+
+# The release an environment runs is recorded in the cluster (ConfigMap
+# platform-release, data.release) at the end of every successful upgrade and of
+# the first `up`. Git alone cannot tell: a release pushed before it was upgraded
+# to, or a second environment on the same branch, looks deployed when it is not.
+# Empty when there is no record (installs older than this mechanism, no access).
+_release_marker_get() {
+  command -v kubectl >/dev/null 2>&1 || return 0
+  local v
+  v="$(kubectl --context "$1" --request-timeout=10s get configmap "$RELEASE_MARKER" -n "$NS_PLATFORM" \
+        -o jsonpath='{.data.release}' 2>/dev/null || true)"
+  case "$v" in baseline|v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9]*) echo "$v" ;; esac
+  return 0
+}
+
+# _release_marker_set ENV RELEASE COMMIT. Not managed by Argo CD or Terraform, so neither reverts it.
+_release_marker_set() {
+  kubectl --context "$1" create configmap "$RELEASE_MARKER" -n "$NS_PLATFORM" \
+      --from-literal=release="$2" --from-literal=commit="$3" --dry-run=client -o yaml 2>/dev/null \
+    | kubectl --context "$1" apply -f - >/dev/null 2>&1
+}
+
+_upgrade_usage() {
+  cat <<EOF
+usage: platformctl upgrade [ENV] [--to TAG] [--plan-only] [--yes] [--allow-replace [STAGE:]ADDR]...
+  Upgrade ENV to the newest release (or to --to TAG), one release at a time:
+    ./platformctl upgrade <env>
+  It fetches the release tags from the repository you forked from (git remote
+  '${UPGRADE_REMOTE}'), merges the next release into this branch, applies it, and
+  repeats. If you already merged a release tag yourself (not pushed), only that
+  release is applied.
+  Steps per release: checks -> release notes -> plan guard on every stage ->
+  apply each stage from its saved plan -> git push -> wait for Argo CD ->
+  status --check.
+  --to TAG         stop at this release (e.g. v2026.12.0) instead of the newest
+  --plan-only      run the checks and the plan guard for the next release, change nothing
+  --yes, -y        do not ask for confirmation after the release notes
+  --allow-replace  accept a guarded delete/replace at this Terraform address
+                   (repeatable; prefix STAGE: to limit it to one stage)
+  See UPGRADING.md.
+EOF
+}
+
+# Terraform stages in apply order (same discovery as the Makefile's MODULES).
+_upgrade_stages() {
+  (cd "$TF_DIR" && find . -name backend.tf -not -path '*/.terraform/*' -exec dirname {} \; | sort -u)
+}
+
+# ./30.eks/30.cluster -> 30.eks_30.cluster (the Makefile's PLAN_NAME).
+_upgrade_plan_name() { local s="${1#./}"; s="${s%/}"; echo "${s//\//_}"; }
+
+# Plan one stage into tf-plans/ and run the plan guard on it.
+# Returns 0 clean, 3 guarded, anything else = the plan itself failed.
+_upgrade_plan_and_guard() {
+  local env="$1" stage="$2" manifest="$3"; shift 3
+  local json rc=0
+  json="${TF_DIR}/tf-plans/$(_upgrade_plan_name "$stage").json"
+  make -C "$TF_DIR" plan-save MODULE="$stage" ENVIRONMENT="$env" || return 1
+  [ -s "$json" ] || { warn "no plan JSON at ${json#"$REPO_ROOT"/}"; return 1; }
+  python3 "${LIB_DIR}/plan_guard.py" "$json" --stage "$stage" --manifest "$manifest" "$@" || rc=$?
+  return "$rc"
+}
+
+# A node that never became ready is not replaced by Karpenter, drifted or not:
+# it disrupts a node only after it initialized, and it counts the node's
+# capacity for the pods that wait. Seen with a GPU node of the previous release
+# that never reported its GPU: the node stays, and the model waits for ever.
+# Deleting the NodeClaim makes Karpenter start a new node, which the new
+# release's GPU stack brings up. Nothing runs on such a node but daemons.
+# (5 minutes old when drifted, 15 when not; see ops/lib/stuck_nodes.py.)
+_upgrade_retire_stuck_nodes() {
+  local env="$1" name kind pool
+  kubectl --context "$env" get nodeclaims.karpenter.sh -o json 2>/dev/null \
+    | python3 "${LIB_DIR}/stuck_nodes.py" 2>/dev/null \
+    | while read -r name kind pool; do
+        [ -n "$name" ] || continue
+        warn "node ${name} (${kind}, pool ${pool}) never became ready; removing it so Karpenter starts a replacement"
+        kubectl --context "$env" delete nodeclaims.karpenter.sh "$name" --wait=false >/dev/null 2>&1 || true
+      done || true
+}
+
+# Wait until every Argo CD Application is Synced + Healthy and every app that
+# tracks the GitOps repo has compared the pushed commit (so the old revision
+# being healthy does not count).
+_upgrade_wait_converged() {
+  local env="$1" head="$2" deadline now lines repo pending total
+  case "$UPGRADE_CONVERGE_TIMEOUT" in ''|*[!0-9]*) die "UPGRADE_CONVERGE_TIMEOUT must be a number of seconds" ;; esac
+  deadline=$(( $(date +%s) + UPGRADE_CONVERGE_TIMEOUT ))
+  repo="$(kubectl --context "$env" get application bootstrap -n argocd -o jsonpath='{.spec.source.repoURL}' 2>/dev/null || true)"
+  log "Waiting for Argo CD: every Application Synced + Healthy at ${head:0:12} (timeout $((UPGRADE_CONVERGE_TIMEOUT / 60)) min)"
+  while :; do
+    lines="$(kubectl --context "$env" get applications -n argocd \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.sync.status}{"\t"}{.status.health.status}{"\t"}{.status.sync.revision}{"\t"}{.spec.source.repoURL}{"\n"}{end}' 2>/dev/null || true)"
+    pending="$(printf '%s\n' "$lines" | awk -F'\t' -v head="$head" -v repo="$repo" '
+      NF == 0 || $1 == "" { next }
+      $2 != "Synced" || $3 != "Healthy" || (repo != "" && $5 == repo && $4 != head) {
+        printf "    %-32s sync=%s health=%s revision=%s\n", $1, ($2 == "" ? "?" : $2), ($3 == "" ? "?" : $3), substr($4, 1, 12)
+      }')"
+    total="$(printf '%s\n' "$lines" | awk -F'\t' '$1 != "" { n++ } END { print n + 0 }')"
+    if [ "$total" -gt 0 ] && [ -z "$pending" ]; then
+      ok "all ${total} Argo CD Applications Synced + Healthy"
+      return 0
+    fi
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      warn "Argo CD did not converge within $((UPGRADE_CONVERGE_TIMEOUT / 60)) min. Not ready:
+${pending:-    (no Applications found in namespace argocd)}"
+      return 1
+    fi
+    _upgrade_retire_stuck_nodes "$env"
+    sleep 15
+  done
+}
+
+cmd_upgrade() {
+  local envarg="" plan_only=0 yes=0 to="" allow=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan-only) plan_only=1 ;;
+      --to)
+        shift; [ $# -gt 0 ] && [ -n "$1" ] || die "--to needs a release tag (e.g. v2026.12.0)"
+        to="$1" ;;
+      --to=*)      to="${1#--to=}" ;;
+      -y|--yes)    yes=1 ;;
+      --allow-replace)
+        shift; [ $# -gt 0 ] && [ -n "$1" ] || die "--allow-replace needs a Terraform address (e.g. aws_s3_bucket.model_cache[0])"
+        allow+=(--allow-replace "$1") ;;
+      --allow-replace=*) allow+=(--allow-replace "${1#--allow-replace=}") ;;
+      -h|--help)   _upgrade_usage; return 0 ;;
+      -*)          die "unknown flag: $1 (see: ./platformctl upgrade --help)" ;;
+      *)           [ -z "$envarg" ] || die "more than one environment given: '${envarg}' and '$1'"; envarg="$1" ;;
+    esac
+    shift
+  done
+
+  # -- 1. preconditions ---------------------------------------------------- #
+  need git; need python3; need make; need terraform
+  local env; env=$(need_env "$envarg" "upgrade")
+  require_tfvars "$env"; check_tfvars_filled "$env"; pin_region "$env"
+  local tfvars="${TF_DIR}/00.global/vars/${env}.tfvars" g=(git -C "$REPO_ROOT")
+
+  "${g[@]}" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 && die "a merge is still in progress.
+  Resolve the conflicts and run 'git commit' (or 'git merge --abort'), then rerun."
+  local dirty; dirty="$("${g[@]}" status --porcelain 2>/dev/null)"
+  [ -z "$dirty" ] || die "the working tree has uncommitted changes (gitignored files such as tfvars do not count):
+$(printf '%s\n' "$dirty" | sed 's/^/    /')
+  Commit or stash them, then rerun."
+  local branch upstream remote merge_ref
+  branch="$("${g[@]}" symbolic-ref -q --short HEAD 2>/dev/null)" || die "HEAD is detached. Check out the branch Argo CD tracks (e.g. git checkout main), merge the release there, then rerun."
+  upstream="$("${g[@]}" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || die "branch '${branch}' has no upstream, so the deployed release is unknown.
+  Point it at the branch Argo CD tracks, e.g.:  git branch --set-upstream-to=origin/${branch}"
+  remote="$("${g[@]}" config "branch.${branch}.remote")"
+  merge_ref="$("${g[@]}" config "branch.${branch}.merge")"
+  "${g[@]}" fetch --quiet "$remote" "$merge_ref" 2>/dev/null \
+    || warn "could not fetch ${upstream}; using the local copy (the push at the end fails if it is out of date)."
+  "${g[@]}" merge-base --is-ancestor '@{u}' HEAD || die "HEAD does not contain ${upstream} (someone pushed since you merged, or the branches diverged).
+  Bring it in first (git merge ${upstream}), then rerun."
+  local ahead; ahead="$("${g[@]}" rev-list --count '@{u}..HEAD')"
+  case "$to" in ""|v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9]*) ;; *) die "--to takes a release tag (vYYYY.MM.N, e.g. v2026.12.0), not '${to}'." ;; esac
+
+  # -- 2. release path ------------------------------------------------------ #
+  # Deployed = what the cluster recorded; without a record, what Argo CD syncs.
+  local rm=(python3 "${LIB_DIR}/release_manifest.py") recorded deployed head_rel
+  recorded="$(_release_marker_get "$env")"
+  deployed="$recorded"
+  [ -n "$deployed" ] || deployed="$("${rm[@]}" release-of --repo "$REPO_ROOT" --rev '@{u}')" \
+    || die "cannot read the releases in ${upstream} (see above)."
+  head_rel="$("${rm[@]}" release-of --repo "$REPO_ROOT" --rev HEAD)" || die "cannot read the releases in HEAD (see above)."
+
+  # Carried from one release to the next when several are applied in a row.
+  local again=("${BASH:-bash}" "${REPO_ROOT}/platformctl" upgrade "$env")
+  [ "$yes" -eq 0 ] || again+=(--yes)
+  [ ${#allow[@]} -eq 0 ] || again+=("${allow[@]}")
+
+  # -- 2a. nothing merged yet: fetch the releases, merge the next one -------- #
+  if [ "$head_rel" = "$deployed" ]; then
+    "${g[@]}" remote get-url "$UPGRADE_REMOTE" >/dev/null 2>&1 || die "'${env}' is on ${deployed} and no newer release is merged in this checkout.
+  To look for one, upgrade needs the repository you forked from as git remote '${UPGRADE_REMOTE}':
+    git remote add ${UPGRADE_REMOTE} <its URL>
+  then rerun:  ./platformctl upgrade ${env}"
+    "${g[@]}" fetch --quiet --tags "$UPGRADE_REMOTE" || die "could not fetch the releases from git remote '${UPGRADE_REMOTE}'."
+    local final="$to" hops next
+    [ -n "$final" ] || final="$("${rm[@]}" newest-tag --repo "$REPO_ROOT" --remote "$UPGRADE_REMOTE")" \
+      || die "could not list the release tags of git remote '${UPGRADE_REMOTE}' (see above)."
+    [ -n "$final" ] || die "git remote '${UPGRADE_REMOTE}' has no release tags (vYYYY.MM.N)."
+    local newest_ok=(); [ -n "$to" ] || newest_ok=(--older-ok)
+    hops="$("${rm[@]}" upgrade-path --repo "$REPO_ROOT" --deployed-release "$deployed" --target "$final" ${newest_ok[@]+"${newest_ok[@]}"})" \
+      || die "cannot upgrade '${env}' from ${deployed} to ${final} (see above)."
+    if [ -z "$hops" ]; then
+      ok "'${env}' is on ${deployed}; there is no newer release to upgrade to."
+      return 0
+    fi
+    next="$(printf '%s\n' "$hops" | head -n 1)"
+    log "Upgrade path for '${env}': ${deployed} -> $(printf '%s\n' "$hops" | paste -sd' ' - | sed 's/ / -> /g')"
+    local before; before="$("${g[@]}" rev-parse HEAD)"
+    log "Merging ${next} into ${branch} (local; pushed after Terraform)"
+    if ! "${g[@]}" merge --no-edit "refs/tags/${next}" >/dev/null 2>&1; then
+      die "release ${next} conflicts with changes in this fork:
+$("${g[@]}" diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/    /')
+  Resolve the conflicts, then:
+    git add -A && git commit
+    ./platformctl upgrade ${env}${to:+ --to ${to}}
+  Or give up on this upgrade:  git merge --abort"
+    fi
+    if [ "$plan_only" -eq 1 ]; then
+      # Plan the next release with its own code, then put the checkout back.
+      local rc=0
+      # shellcheck disable=SC2064  # expand now: the values are gone when the trap fires
+      trap "git -C '${REPO_ROOT}' reset -q --hard '${before}'" INT TERM
+      "${again[@]}" --plan-only || rc=$?
+      trap - INT TERM
+      "${g[@]}" reset -q --hard "$before"
+      [ "$next" = "$final" ] || log "--plan-only planned ${next} only; later releases are planned after it is applied."
+      return "$rc"
+    fi
+    exec "${again[@]}" --to "$final"
+  fi
+
+  # -- 2b. a release is merged: it must be the next one, and a published one -- #
+  local path target manifest
+  path="$("${rm[@]}" release-path --repo "$REPO_ROOT" --deployed-release "$deployed" --target HEAD --env "$env")" \
+    || die "cannot upgrade '${env}' from ${deployed} to HEAD (see above)."
+  target="${path#* }"
+  manifest="${REPO_ROOT}/releases/${target}.json"
+  [ -f "$manifest" ] || die "release manifest ${manifest#"$REPO_ROOT"/} is missing from the working tree."
+  _upgrade_has_tag() { "${g[@]}" rev-parse -q --verify "refs/tags/${target}^{commit}" >/dev/null 2>&1 \
+    && "${g[@]}" merge-base --is-ancestor "refs/tags/${target}" HEAD; }
+  if ! _upgrade_has_tag; then
+    "${g[@]}" fetch --quiet --tags "$UPGRADE_REMOTE" 2>/dev/null || true
+    if ! _upgrade_has_tag; then
+      if [ "${UPGRADE_ALLOW_UNTAGGED:-0}" = 1 ]; then
+        warn "UPGRADE_ALLOW_UNTAGGED=1: HEAD carries ${target} without its tag. This is not a published release; for release testing only."
+      else
+        die "HEAD carries releases/${target}.json but not the release tag ${target}: what is merged here is a
+  branch, not a published release (it may not have passed the release tests).
+  Undo the merge and let upgrade fetch the release:
+    git reset --hard ORIG_HEAD     # the commit before the merge; check with: git log --oneline -3
+    ./platformctl upgrade ${env}"
+      fi
+    fi
+  fi
+  [ -z "$to" ] || "${rm[@]}" upgrade-path --repo "$REPO_ROOT" --deployed-release "$target" --target "$to" >/dev/null \
+    || die "--to ${to} cannot be reached from ${target} (see above). Nothing changed."
+  log "Upgrade '${env}': ${deployed} -> ${c_bold}${target}${c_rst}  (${ahead} commit(s) ahead of ${upstream})"
+
+  # -- 3. Kubernetes version ----------------------------------------------- #
+  python3 "${LIB_DIR}/release_manifest.py" check-kubernetes --manifest "$manifest" --tfvars "$tfvars" --env "$env" \
+    || die "Kubernetes version not supported by ${target} (see above). Nothing changed."
+  # -- 4. required tfvars --------------------------------------------------- #
+  python3 "${LIB_DIR}/release_manifest.py" check-tfvars --manifest "$manifest" --tfvars "$tfvars" \
+    --example "${TF_DIR}/00.global/vars/example.tfvars" \
+    || die "${env}.tfvars is missing variables ${target} needs (see above). Nothing changed."
+  ok "release path, Kubernetes version and tfvars checked"
+
+  # Cluster access, needed from the first apply on. Checked now so a missing
+  # context or a stale IP allowlist stops the upgrade before anything changes.
+  if [ "$plan_only" -eq 0 ]; then
+    need kubectl
+    kubectl config get-contexts "$env" >/dev/null 2>&1 || die "no kubectl context named '${env}'. Run:  ./platformctl use ${env}"
+    _context_is_cluster "$env" "$(cluster_of "$env")" || die "the kubectl context '${env}' does not point at cluster '$(cluster_of "$env")'. Run:  ./platformctl use ${env}"
+    [ "$(kubectl config current-context 2>/dev/null)" = "$env" ] || die "the current kubectl context is not '${env}' (status --check runs against it). Run:  ./platformctl use ${env}"
+    [ "$(kubectl --context "$env" --request-timeout=10s get --raw /readyz 2>/dev/null)" = "ok" ] \
+      || die "cannot reach the '${env}' cluster API (your IP is probably not allowlisted). Run:  ./platformctl allow-ip ${env}"
+    # First upgrade with a release record: write down where the env starts,
+    # before anything changes. If this upgrade pushes and then stops (Argo CD
+    # not healthy), git alone would call the new release deployed; the record
+    # makes the rerun repeat this release instead of moving on.
+    [ -n "$recorded" ] || _release_marker_set "$env" "$deployed" "$("${g[@]}" rev-parse '@{u}')" \
+      || warn "could not record ${deployed} in the cluster (ConfigMap ${RELEASE_MARKER} in ${NS_PLATFORM}); continuing."
+  fi
+
+  # -- 5. release notes + manual steps -------------------------------------- #
+  local notes="${REPO_ROOT}/docs/releases/${target}.md" steps
+  echo
+  if [ -f "$notes" ]; then
+    log "Release notes (${notes#"$REPO_ROOT"/})"
+    sed 's/^/  /' "$notes"
+  else
+    warn "no release notes at ${notes#"$REPO_ROOT"/}"
+  fi
+  steps="$(python3 "${LIB_DIR}/release_manifest.py" manual-steps --manifest "$manifest")" || die "cannot read ${manifest#"$REPO_ROOT"/}"
+  if [ -n "$steps" ]; then
+    echo; warn "Manual steps for ${target} (do them before continuing):"; echo "$steps"
+  fi
+  echo
+  if [ "$plan_only" -eq 0 ] && [ "$yes" -eq 0 ]; then
+    local go=""
+    read -r -p "Continue the upgrade of '${env}' to ${target}? Type 'yes' to continue: " go || true
+    [ "$go" = "yes" ] || die "aborted (nothing changed)."
+  fi
+
+  # -- 6. guard pass: plan every stage before anything is applied ----------- #
+  local stages stage rc blocked=""
+  stages="$(_upgrade_stages)"
+  [ -n "$stages" ] || die "no Terraform stages found under ${TF_DIR#"$REPO_ROOT"/}"
+  log "Plan guard: planning every stage (nothing is applied in this pass)"
+  for stage in $stages; do
+    rc=0; _upgrade_plan_and_guard "$env" "$stage" "$manifest" ${allow[@]+"${allow[@]}"} || rc=$?
+    case "$rc" in
+      0) ;;
+      3) blocked="${blocked}    ${stage#./}\n" ;;
+      *) die "terraform plan failed for ${stage#./} (see above). Nothing was applied." ;;
+    esac
+  done
+  if [ -n "$blocked" ]; then
+    warn "the plan guard stopped the upgrade. Guarded changes in:
+$(printf '%b' "$blocked")
+  Nothing was applied. Check each GUARDED line above. If the change is intended,
+  rerun with the --allow-replace flags printed there (see UPGRADING.md, 'When the plan guard stops')."
+    exit 3
+  fi
+  ok "plan guard: no unacknowledged delete or replace of a protected resource"
+  if [ "$plan_only" -eq 1 ]; then
+    ok "--plan-only: nothing changed. Saved plans (they hold sensitive values): ${TF_DIR#"$REPO_ROOT"/}/tf-plans/"
+    return 0
+  fi
+
+  # -- 7. apply each stage from a fresh saved plan, guarded again ----------- #
+  # Re-planned per stage because an earlier stage's outputs can change what a
+  # later one plans. A failure leaves earlier stages applied and nothing pushed;
+  # rerunning is safe (applied stages then plan no changes).
+  local applied=""
+  for stage in $stages; do
+    log "Stage ${stage#./}: plan, guard, apply"
+    rc=0; _upgrade_plan_and_guard "$env" "$stage" "$manifest" ${allow[@]+"${allow[@]}"} || rc=$?
+    case "$rc" in
+      0) ;;
+      3) die "the plan guard stopped stage ${stage#./} (see above).
+  Applied so far: ${applied:-none}. Nothing pushed. Rerun after deciding on the change (see UPGRADING.md)." ;;
+      *) die "terraform plan failed for ${stage#./}. Applied so far: ${applied:-none}. Nothing pushed.
+  Fix the cause and rerun ./platformctl upgrade ${env} (applied stages then show no changes)." ;;
+    esac
+    make -C "$TF_DIR" apply-saved MODULE="$stage" ENVIRONMENT="$env" || die "terraform apply failed for ${stage#./}.
+  Applied so far: ${applied:-none}. Nothing pushed. Fix the cause and rerun ./platformctl upgrade ${env}."
+    rm -f "${TF_DIR}/tf-plans/$(_upgrade_plan_name "$stage")".tfplan "${TF_DIR}/tf-plans/$(_upgrade_plan_name "$stage")".json
+    applied="${applied:+${applied}, }${stage#./}"
+  done
+  ok "all Terraform stages applied"
+
+  # -- 8. push, then nudge Argo CD ------------------------------------------ #
+  local head; head="$("${g[@]}" rev-parse HEAD)"
+  log "Pushing ${target} to ${upstream} (Argo CD syncs from there)"
+  "${g[@]}" push "$remote" "HEAD:${merge_ref}" || die "git push to ${upstream} was rejected. Terraform is already applied.
+  Bring in the remote commits (git pull --no-rebase), then push yourself (git push) and run:  ./platformctl status ${env} --check"
+  kubectl --context "$env" annotate application bootstrap -n argocd argocd.argoproj.io/refresh=hard --overwrite >/dev/null 2>&1 \
+    || warn "could not request an Argo CD refresh of 'bootstrap'; it picks up the commit on its next poll."
+
+  # -- 9. converge, 10. check ----------------------------------------------- #
+  _upgrade_wait_converged "$env" "$head" || die "upgrade pushed, but Argo CD has not converged. Inspect the apps above
+  (kubectl --context ${env} get applications -n argocd), then run:  ./platformctl status ${env} --check"
+  if ! cmd_status "$env" --check; then
+    die "upgrade to ${target} applied and pushed, but status --check failed (see above)."
+  fi
+
+  # -- 11. Kubernetes hint --------------------------------------------------- #
+  local hint
+  hint="$(python3 "${LIB_DIR}/release_manifest.py" kubernetes-hint --manifest "$manifest" --tfvars "$tfvars" --env "$env" 2>/dev/null || true)"
+  [ -z "$hint" ] || { echo; warn "$hint"; }
+  local recorded_ok=1
+  _release_marker_set "$env" "$target" "$head" || recorded_ok=0
+  [ "$recorded_ok" -eq 1 ] \
+    || warn "could not record ${target} in the cluster (ConfigMap ${RELEASE_MARKER} in ${NS_PLATFORM})."
+  echo
+  ok "'${env}' is on ${target}."
+
+  # -- 12. more releases to go (upgrade was asked for a later one) ---------- #
+  if [ -n "$to" ] && [ "$to" != "$target" ]; then
+    # The next release starts from the record. Without it, an older record
+    # would make the next run apply this release again, and again.
+    [ "$recorded_ok" -eq 1 ] || die "'${env}' is on ${target}, but that could not be recorded in the cluster, so upgrade
+  stops here instead of going on to ${to}. Check that you may write ConfigMaps in namespace ${NS_PLATFORM}, then rerun:
+    ./platformctl upgrade ${env} --to ${to}"
+    echo
+    exec "${again[@]}" --to "$to"
+  fi
 }
 
 # ---- use ------------------------------------------------------------------- #
@@ -774,15 +1664,26 @@ cmd_list_envs() {
 
 main() {
   local cmd="${1:-}"; shift || true
+  # These commands take an environment name and have no help of their own: without
+  # this, `tunnel --help` restarts the tunnel and `up --help` looks for --help.tfvars.
+  case "$cmd" in
+    up|use|down|status|tunnel|edge|list-envs|envs)
+      local arg
+      for arg in "$@"; do
+        case "$arg" in -h|--help) usage; return 0 ;; esac
+      done ;;
+  esac
   case "$cmd" in
     up)        cmd_up "$@" ;;
     use)       cmd_use "$@" ;;
     down)      cmd_down "$@" ;;
     status)    cmd_status "$@" ;;
     tunnel)    cmd_tunnel "$@" ;;
+    allow-ip)  cmd_allow_ip "$@" ;;
     edge)      cmd_edge "$@" ;;
     new-model) cmd_new_model "$@" ;;
     onboard-team) cmd_onboard_team "$@" ;;
+    upgrade)   cmd_upgrade "$@" ;;
     list-envs|envs) cmd_list_envs "$@" ;;
     ""|-h|--help|help) usage ;;
     *) die "unknown command: ${cmd}

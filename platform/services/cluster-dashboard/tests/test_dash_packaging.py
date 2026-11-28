@@ -1,0 +1,386 @@
+"""Packaging guard: every Python package file shipped in a ConfigMap must be
+projected back to its package path in every volume that imports the package.
+
+ConfigMap keys cannot contain "/", so `scripts/pha/db.py` ships under the key
+`pha__db.py` and volumes map it back with `items`. Forgetting one entry would
+only fail at pod start (ImportError), so it is checked here.
+"""
+import ast
+import os
+import re
+import shutil
+import subprocess
+
+import pytest
+import yaml
+
+DASH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load(name):
+    with open(os.path.join(DASH, name), encoding="utf-8") as f:
+        return [d for d in yaml.safe_load_all(f) if d]
+
+
+def _package_keys():
+    """{configmap name: {key: source path}} for keys of the form <pkg>__<file>."""
+    out = {}
+    for gen in _load("kustomization.yaml")[0]["configMapGenerator"]:
+        for entry in gen.get("files", []):
+            if "=" in entry:
+                key, src = entry.split("=", 1)
+                out.setdefault(gen["name"], {})[key] = src
+    return out
+
+
+def _projecting_volumes():
+    """(workload, configmap, {key: path}) for every configMap volume with items."""
+    found = []
+    for manifest in ("manifests.yaml", "pha-event-watcher.yaml"):
+        for doc in _load(manifest):
+            if doc.get("kind") != "Deployment":
+                continue
+            for vol in doc["spec"]["template"]["spec"].get("volumes", []):
+                cm = vol.get("configMap") or {}
+                if cm.get("items"):
+                    found.append((doc["metadata"]["name"], cm["name"],
+                                  {i["key"]: i["path"] for i in cm["items"]}))
+    return found
+
+
+def test_keys_follow_the_naming_rule():
+    for keys in _package_keys().values():
+        for key, src in keys.items():
+            pkg, filename = key.split("__", 1)
+            assert src == f"scripts/{pkg}/{filename}", key
+            assert os.path.exists(os.path.join(DASH, src)), src
+
+
+def test_every_package_file_is_projected_wherever_the_package_is_mounted():
+    keys = _package_keys()
+    volumes = _projecting_volumes()
+    assert {w for w, _, _ in volumes} >= {"cluster-dashboard", "event-watcher"}
+    for workload, cm, items in volumes:
+        pkg_items = {k: v for k, v in items.items() if "__" in k}
+        packages = {v.split("/")[0] for v in pkg_items.values()}
+        expected = {k: "/".join(k.split("__", 1)) for k in keys.get(cm, {}) if k.split("__", 1)[0] in packages}
+        assert pkg_items == expected, f"{workload}: projection of {cm} out of date"
+        # Plain files keep their key as their path.
+        assert all(k == v for k, v in items.items() if "__" not in k), workload
+
+
+def test_every_package_file_is_shipped():
+    shipped = {src for keys in _package_keys().values() for src in keys.values()}
+    for pkg in ("pha", "dashboard"):
+        on_disk = {f"scripts/{pkg}/{f}" for f in os.listdir(os.path.join(DASH, "scripts", pkg))
+                   if f.endswith(".py")}
+        assert on_disk <= shipped, f"not in kustomization.yaml: {sorted(on_disk - shipped)}"
+
+
+def test_every_watch_has_a_matching_rbac_rule():
+    """A watch the ClusterRole does not allow fails at run time, in the cluster,
+    with a 403 that no unit test sees. Cluster-scoped and all-namespace watches
+    need the ClusterRole; this checks those."""
+    import re
+
+    import yaml
+
+    from dashboard import config
+    from dashboard.app import cache_specs
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(here, "manifests.yaml"), encoding="utf-8") as f:
+        docs = [d for d in yaml.safe_load_all(f) if d]
+    rules = next(d for d in docs if d["kind"] == "ClusterRole" and d["metadata"]["name"] == "cluster-dashboard")["rules"]
+    allowed = {(g, r) for rule in rules if {"list", "watch"} <= set(rule["verbs"])
+               for g in rule["apiGroups"] for r in rule["resources"]}
+    settings = config.load({"CLUSTER_NAME": "c", "AWS_REGION": "eu-central-1"})
+    missing = []
+    for name, path, *_ in cache_specs(settings):
+        m = re.fullmatch(r"/api(?:s/(?P<group>[^/]+))?/v[^/]+(?:/namespaces/[^/]+)?/(?P<resource>[^/]+)", path)
+        assert m, f"unexpected watch path for {name}: {path}"
+        if "/namespaces/" in path and (m.group("group") or "", m.group("resource")) not in allowed:
+            continue      # namespaced watches may be granted by a Role in that namespace
+        if (m.group("group") or "", m.group("resource")) not in allowed:
+            missing.append(f"{name}: {path}")
+    assert missing == []
+
+
+# ---------------------------------------------------------------------------
+# Package install (init container)
+# ---------------------------------------------------------------------------
+
+def _install_script():
+    dep = next(d for d in _load("manifests.yaml")
+               if d.get("kind") == "Deployment" and d["metadata"]["name"] == "cluster-dashboard")
+    (init,) = dep["spec"]["template"]["spec"]["initContainers"]
+    assert init["command"] == ["/bin/sh", "-c"]
+    (script,) = init["args"]
+    return script
+
+
+@pytest.mark.parametrize("pip_exit", [0, 1])
+def test_install_container_exits_with_pips_status(tmp_path, pip_exit):
+    """All Kubernetes data depends on the installed packages. A failed install
+    must fail the init container (the kubelet then retries it with backoff
+    and the pod is not Ready), not start a backend that stays empty."""
+    bin_dir, pydeps = tmp_path / "bin", tmp_path / "pydeps"
+    bin_dir.mkdir()
+    pydeps.mkdir()
+    pip = bin_dir / "pip"
+    pip.write_text(f"#!/bin/sh\necho 'ERROR: no route to PyPI' >&2\nexit {pip_exit}\n")
+    pip.chmod(0o755)
+    script = _install_script().replace("/pydeps", str(pydeps)).replace("/tmp/", f"{tmp_path}/")
+    done = subprocess.run(["/bin/sh", "-c", script], env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+                          capture_output=True, text=True, timeout=30, check=False)
+    assert done.returncode == pip_exit
+    if pip_exit:
+        assert "ERROR: no route to PyPI" in done.stderr, "pip's error must reach the container log"
+    assert list(pydeps.iterdir()) == [], "no failure marker: the exit status is the signal"
+
+
+# ---------------------------------------------------------------------------
+# A change to code the dashboard imports must restart the dashboard
+# ---------------------------------------------------------------------------
+
+BACKEND_CM = "cluster-dashboard-backend"
+
+
+def _pha_imports(path):
+    """Names of the `pha` modules a Python file imports (`from pha import x`,
+    `import pha.x`, `from pha.x import y`), at any nesting level."""
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    found = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module == "pha":
+            found |= {a.name for a in n.names}
+        elif isinstance(n, ast.ImportFrom) and (n.module or "").startswith("pha."):
+            found.add(n.module.split(".")[1])
+        elif isinstance(n, ast.Import):
+            found |= {a.name.split(".")[1] for a in n.names if a.name.startswith("pha.")}
+    return found
+
+
+def _dashboard_pha_modules():
+    """Every pha module the dashboard process loads, directly or through
+    another pha module, plus the package's __init__."""
+    scripts = os.path.join(DASH, "scripts")
+    todo = _pha_imports(os.path.join(scripts, "backend.py"))
+    for name in os.listdir(os.path.join(scripts, "dashboard")):
+        if name.endswith(".py"):
+            todo |= _pha_imports(os.path.join(scripts, "dashboard", name))
+    seen = set()
+    while todo:
+        mod = todo.pop()
+        seen.add(mod)
+        todo |= _pha_imports(os.path.join(scripts, "pha", f"{mod}.py")) - seen
+    return seen | {"__init__"}
+
+
+def _dashboard_volumes():
+    dep = next(d for d in _load("manifests.yaml")
+               if d.get("kind") == "Deployment" and d["metadata"]["name"] == "cluster-dashboard")
+    return dep["spec"]["template"]["spec"]["volumes"]
+
+
+def test_dashboard_code_comes_only_from_the_hashed_configmap():
+    """Python is loaded once at process start. Everything the dashboard
+    imports must be in the ConfigMap whose name carries a content hash, so a
+    change gives the Deployment a new pod template and restarts the pod. The
+    agent's ConfigMap has a fixed name: a change there restarts nothing."""
+    assert _dashboard_pha_modules() >= {"__init__", "db", "jobs", "log"}
+    gen = {g["name"]: g for g in _load("kustomization.yaml")[0]["configMapGenerator"]}
+    assert not (gen[BACKEND_CM].get("options") or {}).get("disableNameSuffixHash")
+    shipped = _package_keys()[BACKEND_CM]
+    for mod in sorted(_dashboard_pha_modules()):
+        assert shipped.get(f"pha__{mod}.py") == f"scripts/pha/{mod}.py", f"pha/{mod}.py is not in {BACKEND_CM}"
+    code_volumes = {v["name"]: v["configMap"]["name"] for v in _dashboard_volumes()
+                    if (v.get("configMap") or {}).get("items")}
+    assert code_volumes == {"backend-script": BACKEND_CM, "pha-lib": BACKEND_CM}
+
+
+def _kustomize():
+    for cmd in (["kustomize", "build"], ["kubectl", "kustomize"]):
+        if shutil.which(cmd[0]):
+            return cmd
+    return None
+
+
+def _rendered_pod_template(directory):
+    out = subprocess.run([*_kustomize(), directory], capture_output=True, text=True, timeout=120, check=True).stdout
+    dep = next(d for d in yaml.safe_load_all(out)
+               if d and d.get("kind") == "Deployment" and d["metadata"]["name"] == "cluster-dashboard")
+    return dep["spec"]["template"]
+
+
+@pytest.mark.skipif(_kustomize() is None, reason="needs kustomize or kubectl")
+@pytest.mark.parametrize("changed,restarts", [
+    ("scripts/pha/db.py", True),               # approval SQL
+    ("scripts/pha/jobs.py", True),             # Remediator Job spec
+    ("scripts/pha/log.py", True),
+    ("scripts/pha/__init__.py", True),
+    ("scripts/dashboard/api.py", True),
+    ("scripts/pha/watch.py", False),           # agent only: the dashboard does not import it
+])
+def test_rendered_pod_template_changes_with_the_code_the_dashboard_imports(tmp_path, changed, restarts):
+    work = tmp_path / "cluster-dashboard"
+    shutil.copytree(DASH, work, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+    before = _rendered_pod_template(str(work))
+    with open(work / changed, "a", encoding="utf-8") as f:
+        f.write("\n# a change\n")
+    after = _rendered_pod_template(str(work))
+    assert (after != before) is restarts
+
+
+# ---------------------------------------------------------------------------
+# Service selectors
+# ---------------------------------------------------------------------------
+
+def _pod_templates():
+    """(kind, name, pod labels) of every workload the directory ships, and of
+    the Jobs the agent and the dashboard create at run time."""
+    from pha import jobs
+    docs = [d for name in _load("kustomization.yaml")[0]["resources"] for d in _load(name)]
+    docs.append(jobs.investigator_job("0b6c2f3e-8a51-4f7d-9c1e-2a3b4c5d6e7f", {}, namespace="ai-platform",
+                                      python_image="p", kubectl_version="v", pip_packages="x"))
+    docs.append(jobs.remediator_job("0b6c2f3e-8a51-4f7d-9c1e-2a3b4c5d6e7f", namespace="ai-platform",
+                                    python_image="p", kubectl_version="v", pip_packages="x"))
+    for doc in docs:
+        spec = doc.get("spec") or {}
+        template = (spec.get("jobTemplate") or {}).get("spec", {}).get("template") or spec.get("template")
+        if isinstance(template, dict) and "spec" in template:
+            yield doc["kind"], doc["metadata"]["name"], (template.get("metadata") or {}).get("labels") or {}
+
+
+def test_a_service_selects_only_the_pods_of_its_deployment():
+    """The viewer-key CronJob's pods carried `app: cluster-dashboard`, the
+    Service's selector: every 15 minutes a pod that listens on nothing was an
+    endpoint of the dashboard Service (and an ALB target) for a few seconds."""
+    services = [d for name in _load("kustomization.yaml")[0]["resources"] for d in _load(name)
+                if d.get("kind") == "Service"]
+    assert {s["metadata"]["name"] for s in services} >= {"cluster-dashboard", "oauth2-proxy"}
+    templates = list(_pod_templates())
+    assert {"Deployment", "CronJob", "Job"} <= {kind for kind, _name, _labels in templates}
+    for svc in services:
+        selector = svc["spec"]["selector"]
+        matching = [(kind, name) for kind, name, labels in templates
+                    if all(labels.get(k) == v for k, v in selector.items())]
+        assert matching == [("Deployment", svc["metadata"]["name"])], svc["metadata"]["name"]
+
+
+# ---------------------------------------------------------------------------
+# Shared ALB (ingress group "ai-platform")
+# ---------------------------------------------------------------------------
+
+LB_ATTRIBUTES = "alb.ingress.kubernetes.io/load-balancer-attributes"
+
+
+def test_dashboard_ingress_sets_the_shared_albs_idle_timeout():
+    """The dashboard shares one ALB with the ingresses in
+    platform/config/ingress.yaml. Load balancer attributes belong to the ALB,
+    not to one ingress: every ingress of the group that sets them must set
+    the same value."""
+    group = "alb.ingress.kubernetes.io/group.name"
+    ingress = next(d for d in _load("manifests.yaml") if d.get("kind") == "Ingress")
+    annotations = ingress["metadata"]["annotations"]
+    assert annotations[LB_ATTRIBUTES] == "idle_timeout.timeout_seconds=1020"
+    shared = os.path.join(DASH, "..", "..", "config", "ingress.yaml")
+    if not os.path.isfile(shared):
+        return
+    with open(shared, encoding="utf-8") as f:
+        for doc in yaml.safe_load_all(f):
+            theirs = ((doc or {}).get("metadata") or {}).get("annotations") or {}
+            if (doc or {}).get("kind") == "Ingress" and LB_ATTRIBUTES in theirs:
+                assert theirs[group] == annotations[group]
+                assert theirs[LB_ATTRIBUTES] == annotations[LB_ATTRIBUTES], doc["metadata"]["name"]
+
+
+# ---------------------------------------------------------------------------
+# One Python image and one kubectl for the Jobs the agent and the dashboard create
+# ---------------------------------------------------------------------------
+
+AGENT_CONFIG = "platform-health-agent-config"
+
+
+def _agent_config():
+    return next(d for d in _load("pha-config.yaml")
+                if d["kind"] == "ConfigMap" and d["metadata"]["name"] == AGENT_CONFIG)["data"]
+
+
+def _deployment_env(manifest, name):
+    dep = next(d for d in _load(manifest) if d.get("kind") == "Deployment" and d["metadata"]["name"] == name)
+    return {e["name"]: e for c in dep["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
+
+
+@pytest.mark.parametrize("manifest,deployment", [("manifests.yaml", "cluster-dashboard"),
+                                                 ("pha-event-watcher.yaml", "event-watcher")])
+def test_job_image_and_kubectl_come_from_the_agent_config(manifest, deployment):
+    """The dashboard creates the Remediator Job, the event watcher the
+    Investigator; both install the same pip pins. The dashboard had its own
+    copy of the two values, which stayed at python:3.12-slim when the agent's
+    moved to 3.15: automated updates only read pha-config.yaml."""
+    env = _deployment_env(manifest, deployment)
+    for key in ("PYTHON_IMAGE", "KUBECTL_VERSION"):
+        assert env[key] == {"name": key, "valueFrom": {"configMapKeyRef": {"name": AGENT_CONFIG, "key": key}}}
+        assert _agent_config().get(key), key
+
+
+def test_one_python_image_in_every_pod_and_job():
+    """The wheels pinned for the init containers and for the Jobs must exist
+    for one Python version, not two."""
+    images = {"PYTHON_IMAGE": _agent_config()["PYTHON_IMAGE"]}
+    for name in _load("kustomization.yaml")[0]["resources"]:
+        for doc in _load(name):
+            spec = doc.get("spec") or {}
+            pod = ((spec.get("jobTemplate") or {}).get("spec", {}).get("template") or spec.get("template") or {})
+            for c in (pod.get("spec") or {}).get("initContainers", []) + (pod.get("spec") or {}).get("containers", []):
+                if c["image"].startswith("python:"):
+                    images[f'{doc["kind"]}/{doc["metadata"]["name"]}/{c["name"]}'] = c["image"]
+    assert len(images) >= 6 and len(set(images.values())) == 1, images
+
+
+def test_kubectl_is_within_one_minor_of_the_default_cluster_version():
+    """kubectl supports one minor version of skew against the API server. The
+    Jobs fetch https://dl.k8s.io/release/<KUBECTL_VERSION>/bin/linux/amd64/kubectl
+    (pha/jobs.py), so the value is vMAJOR.MINOR.PATCH."""
+    tfvars = os.path.join(DASH, "..", "..", "..", "terraform", "00.global", "vars", "example.tfvars")
+    if not os.path.isfile(tfvars):
+        pytest.skip("no terraform/00.global/vars/example.tfvars next to this tree")
+    with open(tfvars, encoding="utf-8") as f:
+        cluster = int(re.search(r'kubernetes_version\s*=\s*"1\.(\d+)"', f.read()).group(1))
+    version = re.fullmatch(r"v1\.(\d+)\.\d+", _agent_config()["KUBECTL_VERSION"])
+    assert version, _agent_config()["KUBECTL_VERSION"]
+    assert abs(int(version.group(1)) - cluster) <= 1, f"kubectl 1.{version.group(1)} against Kubernetes 1.{cluster}"
+    from pha import jobs
+    fetch = jobs.investigator_job("i", {}, namespace="n", python_image="p", kubectl_version="v1.2.3",
+                                  pip_packages="x")["spec"]["template"]["spec"]["initContainers"][0]["args"][0]
+    assert "https://dl.k8s.io/release/v1.2.3/bin/linux/amd64/kubectl" in fetch
+
+
+# ---------------------------------------------------------------------------
+# Comments in the shipped code point only at things that exist
+# ---------------------------------------------------------------------------
+
+def _shipped_python():
+    for root, _dirs, files in os.walk(os.path.join(DASH, "scripts")):
+        for name in sorted(files):
+            if name.endswith(".py"):
+                with open(os.path.join(root, name), encoding="utf-8") as f:
+                    yield os.path.relpath(os.path.join(root, name), DASH), f.read()
+
+
+def test_shipped_code_does_not_cite_the_unpublished_design_notes():
+    """The design notes (aidlc-docs/, with their rule numbers R1.., L1..) are
+    not in the repository, so a reference to them leads nowhere."""
+    for path, text in _shipped_python():
+        flat = " ".join(text.split())
+        assert "aidlc-docs" not in flat, path
+        assert "functional design" not in flat and "functional-design" not in flat, path
+        assert not re.search(r"\((?:[RL]\d{1,2})(?:,\s*[RL]\d{1,2})*\)", flat), f"{path}: rule number without its document"
+
+
+def test_derive_docstring_names_something_that_exists():
+    from dashboard import app, derive
+    names = re.findall(r"\bapp\.(\w+)", derive.__doc__)
+    assert names and all(hasattr(app, n) for n in names), names

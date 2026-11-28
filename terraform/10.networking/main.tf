@@ -46,7 +46,7 @@ module "subnets" {
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "5.5.3"
+  version = "6.8.0"
 
   name = local.name
   cidr = var.vpc_cidr
@@ -71,8 +71,13 @@ module "vpc" {
 
 module "endpoints" {
   source  = "terraform-aws-modules/vpc/aws//modules/vpc-endpoints"
-  version = "5.5.3"
-  count   = var.cluster_config.private_eks_cluster ? 1 : 0
+  version = "6.8.0"
+  # Tolerates a cluster_config without private_eks_cluster, with the default
+  # 30.eks/30.cluster applies to the same omission: there
+  # endpoint_public_access = try(!var.cluster_config.private_eks_cluster, false),
+  # i.e. a missing key means a PRIVATE-only API endpoint, so the VPC endpoints
+  # are created here too. Unchanged for any tfvars that sets the key.
+  count = try(var.cluster_config.private_eks_cluster, true) ? 1 : 0
 
   vpc_id                     = module.vpc.vpc_id
   create_security_group      = true

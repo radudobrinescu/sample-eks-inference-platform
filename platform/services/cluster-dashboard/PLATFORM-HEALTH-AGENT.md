@@ -1,10 +1,5 @@
 # Platform Health Agent
 
-> Internal Kubernetes resources keep the name `platform-health-agent` for backwards
-> compatibility. The public-facing display name was changed to avoid a clash
-> with AWS's "Platform Health Agent" service. The ServiceAccounts, ClusterRoles,
-> and the postgres database are all still named `platform-health-agent` / `platform_health_agent`.
-
 > **Packaging:** the agent ships as a **component of the cluster-dashboard app**,
 > not as a standalone service. Its manifests live alongside the dashboard's
 > (`platform/services/cluster-dashboard/pha-*.yaml`, wired via that directory's
@@ -23,23 +18,21 @@ serves a healthy endpoint, and watches nothing (no investigations, no Jobs), so 
 default cluster stays green. Creating the key Secret (one `kubectl` command,
 below) activates it — no Terraform, no GitOps change.
 
-> See [`docs/platform-health-agent-architecture-design.md`](../../../docs/platform-health-agent-architecture-design.md)
-> and [`docs/platform-health-agent-implementation-plan.md`](../../../docs/platform-health-agent-implementation-plan.md)
-> for the full design.
-
 ---
 
 ## Approvals UX
 
-Approvals happen entirely **inside the cluster-dashboard** (`http://<alb>:9090`,
-already restricted by IP allowlist). When the agent finishes an investigation,
+Approvals happen entirely **inside the cluster-dashboard** (`http://localhost:9090`
+over `./platformctl tunnel`, or its CloudFront URL when the edge is on; both sit
+behind the Cognito sign-in). When the agent finishes an investigation,
 the dashboard's topbar shows a `🔔 N pending` badge. Click it to open a panel
 listing each proposed fix with its severity, root cause, fix commands, and
 `[Approve]` / `[Dismiss]` buttons.
 
-**No external messaging system required** — no Slack app, no email, no domain
-or HTTPS setup. Same security model as the dashboard (ALB inbound CIDR
-allowlist).
+**No external messaging system required** — no Slack app, no email. Approving
+or dismissing a fix runs commands against the cluster, so it requires a
+signed-in admin (see [SECURITY.md](../../../SECURITY.md)); everyone else sees
+the proposals read-only.
 
 ---
 
@@ -84,7 +77,14 @@ approvals UI hides the badge once no investigations are pending.
 1. <https://kiro.dev/> → log in → API keys → create a key with headless-mode scope.
 2. Copy the key value (one-time view).
 
-### 2. Create the Secret + activate the watcher
+### 2. Tell the agent which cluster it is on
+
+In `platform/services/cluster-dashboard/pha-config.yaml` set `CLUSTER_NAME` to your
+cluster (`<resources_prefix>-<environment>`, for example `ai-platform-dev`) and
+`AWS_REGION` to its region, then commit and push. The shipped values are
+placeholders; with them the agent's AWS calls fail.
+
+### 3. Create the Secret + activate the watcher
 
 ```bash
 kubectl create secret generic platform-health-agent-secrets \
@@ -105,11 +105,12 @@ the Kiro API key (the DB credentials already live in `ai-platform`).
 Expected:
 1. `event-watcher-…` Pod comes up Ready 1/1 within 60s and logs
    `event-watcher started: …` (instead of the `Platform Health Agent DISABLED` idle line).
-2. cluster-dashboard auto-detects investigations; refresh `http://<alb>:9090` and the topbar shows `🔔 0 pending`.
+2. cluster-dashboard auto-detects investigations; refresh the dashboard (`http://localhost:9090` over `./platformctl tunnel`) and the topbar shows `🔔 0 pending`.
 
 > **Tip:** to keep the key out of shell history / make it reproducible, you can
-> store it in AWS Secrets Manager and sync it with an `ExternalSecret` (the
-> External Secrets Operator is installed) instead of `kubectl create secret`.
+> store it in AWS Secrets Manager and sync it with an `ExternalSecret` instead of
+> `kubectl create secret`. The External Secrets Operator is installed only when
+> `observability_configuration.aws_oss_tooling = true`.
 
 ---
 
@@ -141,7 +142,8 @@ Expected:
                         ┌────────────┴───────────┐
                         │ cluster-dashboard      │ — cluster-dashboard SA
                         │ topbar approvals UI    │   + create-jobs in
-                        │ POST /investigations/  │     ai-platform ns
+                        │ POST /api/v1/          │     ai-platform ns
+                        │   investigations/      │
                         │   <id>/approve         │
                         │ Spawns Remediator      │
                         └────────────┬───────────┘
@@ -160,6 +162,36 @@ Expected:
                         │ status='done'          │
                         └────────────────────────┘
 ```
+
+### Code
+
+The event watcher (`scripts/event_watcher.py`) is the entry point: settings
+from the environment, idle mode without a key, one thread per loop. The
+logic lives in the shared `pha` package (ConfigMap
+`platform-health-agent-scripts`, keys `pha__<file>`, projected to
+`/opt/lib/pha/` by the `pha-lib` volumes):
+
+| Module | Content |
+|---|---|
+| `pha/triggers.py` | Trigger rules as pure functions on Kubernetes objects in their JSON shape: pods, Warning events, nodes, stuck kro resources; owner key for debounce; own workloads and namespace filters |
+| `pha/watch.py` | Watch loops for pods, events and nodes, the stuck-resource scan, and spawning an investigation (throttle, row, Job, debounce) |
+| `pha/rbac.py` | Writer RoleBindings in `inference` and `team-*` (every 5 minutes) |
+| `pha/health.py` | Health endpoint on port 8080 for the probes (Kubernetes API and database reachable) |
+| `pha/db.py` | Agent database: throttle, counters, investigation rows, approvals |
+| `pha/jobs.py` | Investigator and Remediator Job specs (shared with the dashboard backend) |
+| `pha/log.py` | JSON logs |
+
+The dashboard backend imports `pha/db.py`, `pha/jobs.py` and `pha/log.py`. It
+mounts them from its own ConfigMap (`cluster-dashboard-backend`, whose name
+carries a content hash), so a change to one of them restarts the dashboard on
+the next sync. The event watcher reads the fixed-name ConfigMap and needs
+`kubectl rollout restart deployment event-watcher -n ai-platform` after a
+change to its scripts.
+
+Tests run without a cluster or database:
+`python3 -m pytest -q platform/services/cluster-dashboard/tests/test_pha_*.py`.
+The trigger cases are in `tests/pha_cases.py`; with the `kubernetes` package
+on `PYTHONPATH` they also run through the real client models.
 
 ---
 
@@ -180,7 +212,7 @@ All knobs are in [`pha-config.yaml`](./pha-config.yaml). Most useful:
 | `APPROVAL_EXPIRY_HOURS` | Approve buttons disabled after this |
 | `DEBOUNCE_WINDOW_SEC` | Suppress repeat investigations for the same resource |
 
-Editing the ConfigMap and pushing triggers a kustomize rehash → automatic pod restart. In-flight Jobs keep their original env.
+The ConfigMap keeps its name (kustomize adds no hash suffix to it), so editing it and pushing restarts nothing: the event watcher and the dashboard read it when they start. Apply a change with `kubectl rollout restart deployment event-watcher cluster-dashboard -n ai-platform`. In-flight Jobs keep their original env.
 
 ---
 
@@ -212,7 +244,7 @@ kubectl scale deployment event-watcher -n ai-platform --replicas=0
 kubectl scale deployment event-watcher -n ai-platform --replicas=1
 ```
 
-ArgoCD will revert this within ~3 min because of `selfHeal: true`. For a longer pause, set all `TRIGGER_*=false` in the ConfigMap and push.
+ArgoCD will revert this within ~3 min because of `selfHeal: true`. For a longer pause, set all `TRIGGER_*=false` in the ConfigMap, push, and restart the event-watcher (`kubectl rollout restart deployment event-watcher -n ai-platform`).
 
 ### Inspect a running investigation
 
@@ -259,19 +291,15 @@ kubectl logs -n ai-platform job/investigator-<8-char-hex>
 
 ## Cost notes
 
-The agent uses Kiro CLI hosted models:
-- Investigations: `claude-sonnet-4.6` (1.30x credits) — typically 5-30K tokens per run
-- Remediations: `claude-opus-4.6` (2.20x credits) — typically 5-15K tokens per run
-
-With the default budgets, upper bound ~2.6M weighted tokens/day. Adjust `KIRO_MODEL_*` to switch models (e.g. `claude-haiku-4.5` for cheaper investigations).
+The agent uses Kiro CLI hosted models. `KIRO_MODEL_*` in `pha-config.yaml` selects
+them (default `auto`); the daily budgets in the same file bound the spend. Typical
+use is 5-30K tokens per investigation and 5-15K per remediation.
 
 ---
 
 ## Future work
 
 - ESO-backed secret rotation
-- `awslabs.eks-mcp-server` MCP wiring (V1 uses raw kubectl)
-- Stronger approver auth on the dashboard (basic auth / OIDC)
 - Webhook-style remediation that opens a PR instead of applying imperatively
 - ARM64 image variants
 - Prometheus metrics + Grafana dashboard

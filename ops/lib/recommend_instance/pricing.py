@@ -39,7 +39,12 @@ def _pricing_cache_path(region: str) -> Path:
     return base / "ai-platform" / f"pricing-{region}.json"
 
 
-def _load_cached_prices(region: str) -> dict[str, float] | None:
+def _load_cached_prices(region: str, wanted: list[str] | None = None) -> dict[str, float] | None:
+    """Cached prices for `region`, or None when the cache is missing, older than
+    PRICING_CACHE_TTL_SEC, or did not look up every type in `wanted` (a type
+    added to the catalog after the cache was written would otherwise get the
+    static us-east-1 price in every region for up to 30 days). A type the
+    region does not offer was looked up and has no price; that is fine."""
     path = _pricing_cache_path(region)
     if not path.exists():
         return None
@@ -47,16 +52,19 @@ def _load_cached_prices(region: str) -> dict[str, float] | None:
         payload = json.loads(path.read_text())
         if time.time() - payload.get("timestamp", 0) > PRICING_CACHE_TTL_SEC:
             return None
+        if wanted is not None and not set(wanted) <= set(payload.get("queried") or []):
+            return None
         return {k: float(v) for k, v in payload.get("prices", {}).items()}
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
-def _save_cached_prices(region: str, prices: dict[str, float]) -> None:
+def _save_cached_prices(region: str, prices: dict[str, float], queried: list[str] | None = None) -> None:
     path = _pricing_cache_path(region)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"timestamp": time.time(), "region": region, "prices": prices}))
+        path.write_text(json.dumps({"timestamp": time.time(), "region": region, "prices": prices,
+                                    "queried": sorted(queried if queried is not None else prices)}))
     except OSError:
         pass  # Non-fatal; we'll just refetch next time.
 
@@ -78,8 +86,13 @@ def _parse_pricelist_entry(price_list_json: str) -> float | None:
 
 
 def fetch_prices_from_aws(region: str, instance_types: list[str],
-                          verbose: bool = False) -> dict[str, float]:
+                          verbose: bool = False) -> tuple[dict[str, float], list[str]]:
     """Query the AWS Pricing API for on-demand Linux prices in `region`.
+
+    Returns (prices, completed). `completed` lists the types whose lookup got an
+    answer — a price, or no product in that region. A type whose lookup failed
+    (throttling, network) is in neither, so the caller does not mistake "could
+    not ask" for "has no price there".
 
     Requires boto3 + valid AWS credentials. Silent no-op if either is missing.
     """
@@ -90,7 +103,7 @@ def fetch_prices_from_aws(region: str, instance_types: list[str],
         if verbose:
             print("  ! boto3 not installed; falling back to static us-east-1 prices",
                   file=sys.stderr)
-        return {}
+        return {}, []
 
     # Pricing API is global but only exposed in us-east-1, ap-south-1, eu-central-1.
     try:
@@ -98,9 +111,10 @@ def fetch_prices_from_aws(region: str, instance_types: list[str],
     except Exception as e:
         if verbose:
             print(f"  ! could not initialise Pricing client: {e}", file=sys.stderr)
-        return {}
+        return {}, []
 
     prices: dict[str, float] = {}
+    completed: list[str] = []
     for it in instance_types:
         try:
             resp = client.get_products(
@@ -122,27 +136,43 @@ def fetch_prices_from_aws(region: str, instance_types: list[str],
                 if price is not None:
                     prices[it] = price
                     break
+            completed.append(it)
         except (BotoCoreError, ClientError) as e:
             if verbose:
                 print(f"  ! pricing lookup failed for {it}: {e}", file=sys.stderr)
         except Exception as e:
             if verbose:
                 print(f"  ! unexpected error pricing {it}: {e}", file=sys.stderr)
-    return prices
+    return prices, completed
 
 
-def resolve_prices(region: str, refresh: bool, verbose: bool) -> tuple[dict[str, float], str]:
-    """Return (prices_by_instance_type, source_label)."""
-    if not refresh:
-        cached = _load_cached_prices(region)
-        if cached:
-            return cached, f"cache ({region})"
+def _mark_unpriced(prices: dict[str, float], looked_up: list[str]) -> dict[str, float | None]:
+    """`prices` plus a None entry for every type that was looked up and has no
+    price in the region."""
+    return {**{it: None for it in looked_up}, **prices}
 
+
+def resolve_prices(region: str, refresh: bool, verbose: bool) -> tuple[dict[str, float | None], str]:
+    """Return (prices_by_instance_type, source_label).
+
+    With prices from the Pricing API or its cache, a type the API has no price
+    for in `region` maps to None: very likely the type is not offered there. A
+    type that is absent from the mapping was not looked up (a failed lookup);
+    callers fall back to the static catalog price for both, and flag the first.
+    """
     instance_types = [i.name for i in INSTANCES]
-    fetched = fetch_prices_from_aws(region, instance_types, verbose=verbose)
+    if not refresh:
+        cached = _load_cached_prices(region, instance_types)
+        if cached:
+            # The cache is only used when it looked up every type.
+            return _mark_unpriced(cached, instance_types), f"cache ({region})"
+
+    fetched, completed = fetch_prices_from_aws(region, instance_types, verbose=verbose)
     if fetched:
-        _save_cached_prices(region, fetched)
-        return fetched, f"AWS Pricing API ({region})"
+        # Record only the lookups that got an answer: a throttled one must be
+        # asked again on the next run, not kept at the static price for 30 days.
+        _save_cached_prices(region, fetched, completed)
+        return _mark_unpriced(fetched, completed), f"AWS Pricing API ({region})"
 
     # Fall back to the static catalog, flagging if the user asked for a
     # different region than the catalog's baked-in one.

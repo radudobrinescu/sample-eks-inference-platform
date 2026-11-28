@@ -2,22 +2,36 @@
 #
 # The high-throughput sibling of VLLMEndpoint. KRO renders the parts it owns well:
 #   - the vLLM model-server Deployment (N replicas, labeled for the InferencePool),
-#   - the LiteLLM registration Job (so the model answers through the same /v1 door),
+#   - the KEDA ScaledObject that owns the Deployment's replica count,
 #   - an ArgoCD Application that installs the OFFICIAL llm-d router chart
 #     (llm-d-router-standalone) — which supplies the EPP + InferencePool + Envoy
 #     proxy. Delegating the router to the upstream chart keeps us upgrade-safe
 #     instead of freezing ~500 lines of chart output in this RGD.
+# This graph has no LiteLLM registration Job: the litellm-sync controller
+# (platform/services/litellm-sync/) watches this CR and registers the model, so
+# it answers through the same /v1 door.
 #
 # Request path: LiteLLM -> llm-d router (Envoy + EPP) -> InferencePool -> vLLM pod.
 # The EPP scores pods by queue depth, KV-cache utilization, and prefix reuse.
 #
-# MIGRATION: `minReplicas` now has `minimum=1` (scale-to-zero parked). Raising a
-# field's minimum (0 -> 1) is a breaking CRD change KRO refuses to apply in place
-# ("breaking changes detected: Minimum was increased from 0 to 1" -> the RGD goes
-# Inactive). Fresh installs are unaffected (the CRD is created with minimum=1). On
-# an EXISTING cluster that predates this, recreate the CRD once when no
-# LLMDEndpoints are live (safe, it holds no persistent state):
-#   kubectl delete crd llmdendpoints.kro.run   # KRO immediately rebuilds it
+# Scale to zero (opt-in per model, `minReplicas: 0`): KEDA stops the last
+# replica after `scaleToZeroAfterSeconds` without requests, and Karpenter then
+# removes the idle GPU node. The router (EPP) stays up and, with llm-d flow
+# control on, holds a request that arrives while no replica is running for up
+# to `coldStartTimeoutSeconds`. The held request shows in the EPP queue metric,
+# KEDA starts a replica, and the router sends the request on once it is Ready.
+# The first answer then takes as long as a cold start (GPU node + image +
+# model load, a few minutes); later requests are fast until the model idles
+# again. Models with minReplicas >= 1 keep the router config they had.
+#
+# First load of a new minReplicas 0 model: its Deployment starts with one
+# replica, and KEDA does not stop it before `scaleToZeroAfterSeconds` have
+# passed since the model was created. That time runs from creation; it does
+# not wait for the model. A model that needs longer than that to load (GPU
+# node + image + weights) and gets no request meanwhile is stopped before it
+# ever served, and loads for the first time on its first request. So
+# `ready: True` with `scaledToZero: true` says the model is idle at zero; it
+# does not prove the model has ever loaded.
 #
 # Prereqs (shipped by default via the `inference-gateway` platform app — no
 # toggle): GIE CRDs installed + the ghcr.io/llm-d/charts OCI Helm repo registered
@@ -39,27 +53,45 @@ spec:
       # Retained (not removed) to avoid a breaking CRD change (KRO refuses to
       # drop schema properties in place).
       replicas:             "integer | default=1 minimum=0"
-      minReplicas:          "integer | default=1 minimum=1"   # floor (>=1). Scale-to-zero (minReplicas 0) is PARKED: it needs llm-d image pre-baking + a LiteLLM cooldown/hold fix that aren't worth the ~2min cold-start floor yet. The arrival trigger in the ScaledObject below is the inert foundation for it.
+      minReplicas:          "integer | default=1 minimum=0"   # floor; 0 = scale to zero when idle (see the header)
       maxReplicas:          "integer | default=3 minimum=1"   # ceiling; > minReplicas enables KEDA autoscaling
-      targetQueueDepth:     "integer | default=20"            # per-pod vllm:num_requests_waiting scale target
+      # Scale-out target: requests in flight per replica (being served plus
+      # waiting in the router). KEDA adds a replica when the average goes above
+      # it. 16 follows llm-d's KEDA guide; raise it to scale out later (cheaper),
+      # lower it to scale out sooner (faster answers under load).
+      targetInflight:       "integer | default=16 minimum=1"
+      # DEPRECATED - ignored since targetInflight replaced the vLLM queue-depth
+      # trigger. Kept because kro refuses to drop a schema field in place.
+      targetQueueDepth:     "integer | default=20"
+      # minReplicas 0 only. Idle time before the last replica stops, and how long
+      # the router holds a request while the model starts (the router proxy
+      # gives up on a held request after 1000s, hence the maximum).
+      scaleToZeroAfterSeconds: "integer | default=600 minimum=60"
+      coldStartTimeoutSeconds: "integer | default=600 minimum=60 maximum=900"
       maxModelLen:          "integer | default=8192"
       minVramPerGpuGiB:     "integer | default=0"
       workerMemory:         "string  | default=16Gi"
       workerCpu:            "string  | default=8"
-      vllmImage:            "string  | default=vllm/vllm-openai:v0.24.0"
+      vllmImage:            "string  | default=vllm/vllm-openai:v0.33.0"
       # Optional tool/function calling (see VLLMEndpoint). When set, the vLLM
       # server starts with --enable-auto-tool-choice --tool-call-parser <name>;
       # `platformctl new-model` auto-fills it from the model architecture. Empty
       # = chat-only. extraArgs appends any other raw vLLM flags.
       toolCallParser:       "string"
       extraArgs:            "[]string"
-      routerChartVersion:   "string  | default=v0.9.0"
+      routerChartVersion:   "string  | default=v1.0.0"
       # enum rejects typos at admission; without it a misspelled profile silently
       # fell through the CEL scorer-weight ternaries to the 'balanced' weights.
       routingProfile:       'string | default=balanced enum="balanced,prefix,throughput,latency"'   # -> EPP scorer weights
     status:
-      ready:             "${vllmdeployment.status.?availableReplicas.orValue(0) > 0 ? 'True' : 'False'}"
+      # Ready = a replica serves, or the model is idle at zero replicas (a
+      # request then waits in the router while a replica starts). While a
+      # replica starts from zero, ready is False. Ready at zero replicas does
+      # not say the model has loaded before (see "First load" in the header).
+      ready:             "${(vllmdeployment.status.?availableReplicas.orValue(0) > 0 || vllmdeployment.spec.?replicas.orValue(1) == 0) ? 'True' : 'False'}"
       availableReplicas: ${vllmdeployment.status.?availableReplicas.orValue(0)}
+      replicas:          ${vllmdeployment.spec.?replicas.orValue(0)}
+      scaledToZero:      ${vllmdeployment.spec.?replicas.orValue(1) == 0}
       routerHealth:      "${routerapp.status.?health.?status.orValue('Unknown')}"
 
   resources:
@@ -72,7 +104,7 @@ spec:
 
     - id: vllmdeployment
       readyWhen:
-        - ${vllmdeployment.status.?availableReplicas.orValue(0) > 0}
+        - ${vllmdeployment.status.?availableReplicas.orValue(0) > 0 || vllmdeployment.spec.?replicas.orValue(1) == 0}
       template:
         apiVersion: apps/v1
         kind: Deployment
@@ -84,8 +116,10 @@ spec:
         spec:
           # NOTE: replicas is intentionally NOT set — the KEDA ScaledObject/HPA
           # owns the replica count. Setting it here makes KRO reconcile it back
-          # and fight the autoscaler. Initial count comes from the ScaledObject's
-          # minReplicaCount once KEDA reconciles.
+          # and fight the autoscaler. The Deployment starts with the Kubernetes
+          # default of one replica. With minReplicas above 1 KEDA's HPA then
+          # raises it to minReplicas; with minReplicas 0 it stays at one until
+          # KEDA stops it (see the ScaledObject below).
           selector:
             matchLabels:
               app.kubernetes.io/name: ${schema.metadata.name}
@@ -208,11 +242,13 @@ spec:
                     sizeLimit: 8Gi
 
     # --- KEDA autoscaler (always rendered; KEDA owns the replica count) ---
-    # min==max pins a fixed size; max>minReplicas autoscales on vLLM saturation
-    # (per-pod queue depth from the autoscaling Prometheus). Scale-up responsive,
-    # scale-down conservative (GPU pods are slow to start). Requires the
-    # autoscaling capability (KEDA); if absent the Deployment stays at the K8s
-    # default until KEDA is installed.
+    # min==max pins a fixed size; max > minReplicas autoscales on the requests
+    # in flight that the router (EPP) reports, scraped by the autoscaling
+    # Prometheus (platform/config/autoscaling-prometheus.yaml). Scale-up
+    # responsive, scale-down conservative (GPU pods are slow to start).
+    # minReplicas 0: KEDA itself moves the Deployment between 0 and 1 (polled
+    # every 15s); the HPA sizes it from 1 up. Requires the autoscaling
+    # capability (KEDA); if absent the Deployment stays at the K8s default.
     - id: scaledobject
       template:
         apiVersion: keda.sh/v1alpha1
@@ -227,6 +263,15 @@ spec:
             name: ${schema.metadata.name}-llmd
           minReplicaCount: ${schema.spec.minReplicas}
           maxReplicaCount: ${schema.spec.maxReplicas}
+          pollingInterval: 15
+          # minReplicas 0 only: idle time before 1 -> 0. The initial period keeps
+          # KEDA from stopping a new model before the same time has passed since
+          # the ScaledObject was created. It runs from creation and does not
+          # wait for the model: one that needs longer to load, with no request
+          # meanwhile, is stopped before it ever served and loads on its first
+          # request (see "First load" in the header).
+          cooldownPeriod: ${schema.spec.scaleToZeroAfterSeconds}
+          initialCooldownPeriod: ${schema.spec.scaleToZeroAfterSeconds}
           advanced:
             horizontalPodAutoscalerConfig:
               behavior:
@@ -243,27 +288,27 @@ spec:
                       value: 1
                       periodSeconds: 120
           triggers:
-            # Right-sizing above zero: scale on the real vLLM queue depth. This
-            # cannot wake a zero'd pool (no vLLM pod means no metric), so it is
-            # paired with the arrival trigger below for scale-from-zero.
+            # Demand: requests being served (llm_d_epp_request_running) plus
+            # requests the router holds (llm_d_epp_flow_control_queue_size; only
+            # with flow control, i.e. minReplicas 0, else absent = 0). Sizes the
+            # pool at targetInflight per replica, and wakes a pool at zero: a
+            # request held while no replica runs makes the value > 0.
             - type: prometheus
+              name: inflight
               metricType: AverageValue
               metadata:
                 serverAddress: http://autoscaling-prometheus.inference.svc.cluster.local:9090
                 query: |-
-                  sum(max_over_time(vllm:num_requests_waiting{pool="${schema.metadata.name}"}[1m])) or vector(0)
-                threshold: "${string(schema.spec.targetQueueDepth)}"
-                activationThreshold: "1"
-            # Wake-from-zero (PARKED — inert while minReplicas >= 1 is enforced
-            # by the schema; kept as the validated foundation for when scale-to-
-            # zero is unparked). LiteLLM (the always-on front door) counts every
-            # request for this model BEFORE it reaches the EPP — including a
-            # request that arrives while the pool is scaled to zero (the EPP
-            # 503s before it would count anything). activationThreshold "0"
-            # means any request flips the pool 0->1; the high threshold keeps
-            # this trigger from driving scale beyond 1 (the queue-depth trigger
-            # above owns right-sizing once the pool is warm).
+                  (sum(max_over_time(llm_d_epp_request_running{pool="${schema.metadata.name}"}[1m])) or vector(0)) + (sum(max_over_time(llm_d_epp_flow_control_queue_size{pool="${schema.metadata.name}"}[1m])) or vector(0))
+                threshold: "${string(schema.spec.targetInflight)}"
+                activationThreshold: "0"
+            # Second wake signal: LiteLLM (the always-on front door) counts every
+            # request for this model before it reaches the router, so the pool
+            # still wakes if the router could not queue the request (e.g. the
+            # router pod was restarting). The high threshold keeps this trigger
+            # from sizing the pool; the demand trigger above does that.
             - type: prometheus
+              name: litellm-requests
               metricType: AverageValue
               metadata:
                 serverAddress: http://autoscaling-prometheus.inference.svc.cluster.local:9090
@@ -298,8 +343,16 @@ spec:
                     flags:
                       v: 2
                     pluginsConfigFile: "optimized-baseline-plugins.yaml"
+                    # minReplicas 0 adds llm-d flow control (the last line): with no
+                    # replica running the router holds requests for up to
+                    # coldStartTimeoutSeconds instead of answering 503; with
+                    # replicas running a held request waits until the client
+                    # gives up (defaultRequestTTL 0s, as vLLM's own queue did);
+                    # maxBytes caps the memory held requests may use. Other models
+                    # get the same text as before (`|-` + an empty last line), so
+                    # their router does not restart on upgrade.
                     pluginsCustomConfig:
-                      optimized-baseline-plugins.yaml: |
+                      optimized-baseline-plugins.yaml: |-
                         apiVersion: llm-d.ai/v1alpha1
                         kind: EndpointPickerConfig
                         plugins:
@@ -318,6 +371,7 @@ spec:
                             weight: ${string(schema.spec.routingProfile == 'prefix' ? 4 : (schema.spec.routingProfile == 'throughput' ? 1 : (schema.spec.routingProfile == 'latency' ? 2 : 3)))}
                           - pluginRef: no-hit-lru-scorer
                             weight: ${string((schema.spec.routingProfile == 'prefix' || schema.spec.routingProfile == 'latency') ? 1 : 2)}
+                        ${schema.spec.minReplicas == 0 ? "featureGates:\n- flowControl\nflowControl:\n  defaultRequestTTL: 0s\n  noEndpointRequestTTL: " + string(schema.spec.coldStartTimeoutSeconds) + "s\n  maxBytes: 1Gi\n" : ""}
                     resources:
                       requests:
                         cpu: "1"

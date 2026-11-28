@@ -1,6 +1,8 @@
 .ONESHELL:
 SHELL = bash
-SHELLFLAGS = -o pipefail
+# pipefail is set inside each recipe that pipes Terraform into tee (see
+# execute_terraform), not make-wide: GNU make 3.81 (macOS) has neither
+# .SHELLFLAGS nor .ONESHELL, so a make-wide flag would not reach every user.
 
 ENVIRONMENT ?= dev
 AWS_REGION ?= $(shell aws configure get region)
@@ -20,6 +22,15 @@ TF_VAR_tfstate_region := $(TFSTATE_REGION)
 export TF_VAR_tfstate_region
 
 MODULES = $(shell find . -type f -name "backend.tf" -exec dirname {} \; | sort -u )
+
+# Saved plans for plan-save / apply-saved (used by `platformctl upgrade`), one
+# per stage: ./30.eks/30.cluster -> tf-plans/30.eks_30.cluster.tfplan (+ .json).
+# They contain sensitive values in plain text: the directory is mode 700 and
+# gitignored.
+PLAN_DIR := $(CURDIR)/tf-plans
+PLAN_NAME = $(subst /,_,$(patsubst ./%,%,$(patsubst %/,%,$(MODULE))))
+PLAN_FILE = $(PLAN_DIR)/$(PLAN_NAME).tfplan
+PLAN_JSON = $(PLAN_DIR)/$(PLAN_NAME).json
 
 ifeq ($(AUTO_APPROVE), true)
 	TF_AUTO_APPROVE := "-auto-approve"
@@ -42,14 +53,15 @@ define execute_terraform
 	fi
 endef
 
-.PHONY: print-modules clean check-env bootstrap init-all plan-all apply-all destroy-all init refresh plan apply destroy
+.PHONY: print-modules clean check-env bootstrap init-all plan-all apply-all destroy-all init refresh plan apply destroy plan-save apply-saved
 
 print-modules:
 	@for m in $(MODULES); do echo $$m; done
 
+# Removes the local provider/module caches only. The .terraform.lock.hcl files
+# are committed on purpose (see .gitignore) and are left alone.
 clean:
 	@find . -type d -name ".terraform" -prune -exec rm -rf {} \;
-	@find . -type f -name ".terraform.lock.hcl" -prune -exec rm -f {} \;
 
 check-env:
 	@if [ -z $(AWS_REGION) ]; then \
@@ -62,6 +74,7 @@ check-env:
 	 fi
 	@if [ ! -f $(VAR_FILE) ]; then \
   		echo "VAR_FILE: $(VAR_FILE) does not exist."; \
+  		exit 1; \
   	fi
 
 	@mkdir -p tf-logs
@@ -127,7 +140,8 @@ init: check-env
 	fi
 	@rm -rf $(MODULE)/.terraform/*.tfstate
 	@echo ENVIRONMENT=$(ENVIRONMENT) MODULE=$(MODULE) terraform::init
-	@terraform -chdir=$(MODULE) init \
+	@set -o pipefail; \
+	terraform -chdir=$(MODULE) init \
 		-input=false \
 		-backend=true \
 		-backend-config="region=$(TFSTATE_REGION)" \
@@ -176,9 +190,34 @@ apply: init tf-select-ws
 	@# that declares module.ebs_csi_driver_irsa.)
 	@if grep -rqsE '^[[:space:]]*module[[:space:]]+"eks"' $(MODULE)/*.tf 2>/dev/null; then \
 		echo ">> Cluster stage: applying module.eks (+ EBS-CSI IRSA) first so the Kubernetes/Helm/kubectl providers configure against a live endpoint (idempotent: 0 changes once the cluster exists)"; \
+		set -o pipefail; \
 		terraform -chdir=$(MODULE) apply -target=module.eks -target=module.ebs_csi_driver_irsa -input=false -lock=true -auto-approve -var-file=$(VAR_FILE) 2>&1 | tee -a tf-logs/$(notdir $(MODULE))-apply.log || { echo "targeted module.eks apply failed for $(MODULE)"; exit 1; }; \
 	fi
 	@$(call execute_terraform,$(MODULE),apply,"-auto-approve")
+
+# Plan one stage into a saved plan file, plus its JSON form for the plan guard
+# (ops/lib/plan_guard.py). Nothing is applied.
+plan-save: init tf-select-ws
+	@echo ENVIRONMENT=$(ENVIRONMENT) MODULE=$(MODULE) terraform::plan-save
+	@mkdir -p $(PLAN_DIR) && chmod 700 $(PLAN_DIR) && rm -f $(PLAN_FILE) $(PLAN_JSON) || exit 1
+	@$(call execute_terraform,$(MODULE),plan,-out=$(PLAN_FILE))
+	@terraform -chdir=$(MODULE) show -json $(PLAN_FILE) > $(PLAN_JSON) || { echo "terraform show failed for module $(MODULE)"; rm -f $(PLAN_JSON); exit 1; }
+	@echo "Saved plan: $(PLAN_FILE)"
+
+# Apply exactly the plan saved by plan-save: no new plan, and no targeted
+# module.eks pre-step (unlike `apply`, which needs it only when the cluster is
+# first created). Terraform refuses the plan if the state changed since.
+apply-saved: init tf-select-ws
+	@echo ENVIRONMENT=$(ENVIRONMENT) MODULE=$(MODULE) terraform::apply-saved
+	@if [ ! -f $(PLAN_FILE) ]; then echo "No saved plan $(PLAN_FILE); run make plan-save MODULE=$(MODULE) first."; exit 1; fi
+	@set -o pipefail; \
+	terraform -chdir=$(MODULE) apply -input=false -lock=true -compact-warnings $(PLAN_FILE) \
+		2>&1 | tee -a tf-logs/$(notdir $(MODULE))-apply.log; \
+	exit_code=$$?; \
+	if [ $$exit_code -ne 0 ]; then \
+		echo "Terraform apply of the saved plan failed for module $(MODULE)"; \
+		exit $$exit_code; \
+	fi
 
 destroy: init tf-select-ws
 	@echo ENVIRONMENT=$(ENVIRONMENT) MODULE=$(MODULE) terraform::destroy

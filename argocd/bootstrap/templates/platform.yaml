@@ -1,15 +1,15 @@
 # Platform — ArgoCD ApplicationSet defining all platform services.
 #
-# Eight applications (by default) in two shapes:
+# Nine applications (by default) in two shapes:
 #   - Plain-directory sources (platform-config, inference-gateway, litellm,
-#     open-webui, cluster-dashboard, litellm-sync): manifests live in this repo
-#     and are applied as-is.
+#     open-webui, langfuse-clickhouse, cluster-dashboard, litellm-sync):
+#     manifests live in this repo and are applied as-is.
 #   - Helm multi-source (gpu-operator, langfuse): chart pulled from upstream,
 #     values file pulled from this repo.
 #
 # The Platform Health Agent is NOT a separate app — it ships as a component of
 # cluster-dashboard (see the note by that element below). It's always synced but
-# idles unless a Kiro API key is provisioned (Terraform, opt-in).
+# idles until its Kiro API key Secret exists (created with kubectl, opt-in).
 #
 # FORKING THE PLATFORM — set the repo URL in ONE place: var.gitops_repo_url
 # (+ var.gitops_revision) in your tfvars. This directory is a Helm chart; the
@@ -41,7 +41,7 @@ spec:
             type: helm
             chart: gpu-operator
             chartRepo: https://helm.ngc.nvidia.com/nvidia
-            chartVersion: v25.10.1
+            chartVersion: v26.7.2
             valuesPath: platform/services/gpu-operator/helm-values.yaml
             tier: infra
           # GIE CRDs (InferencePool) + the llm-d OCI Helm repo registration —
@@ -69,15 +69,22 @@ spec:
             type: helm
             chart: langfuse
             chartRepo: https://langfuse.github.io/langfuse-k8s
-            chartVersion: "1.5.20"
+            chartVersion: "2.2.5"
             valuesPath: platform/services/langfuse/helm-values.yaml
+            tier: platform
+          # Langfuse's ClickHouse (single node, official image). The chart 2.x can
+          # only deploy ClickHouse through the alpha ClickHouse operator.
+          - name: langfuse-clickhouse
+            namespace: ai-platform
+            type: directory
+            path: platform/services/langfuse-clickhouse
             tier: platform
           # cluster-dashboard ALSO ships the Platform Health Agent as a component
           # (platform/services/cluster-dashboard/pha-*.yaml) — no separate app or
           # namespace. The agent is always synced but idles gracefully unless a
-          # Kiro API key Secret is present (Terraform provisions it only when
-          # platform_health_agent_enabled=true). Enable = set the tfvar (+
-          # TF_VAR_kiro_api_key), apply, restart the event-watcher Deployment.
+          # Kiro API key Secret (platform-health-agent-secrets) is present. It is
+          # created with kubectl, not by Terraform. Enable = create the Secret,
+          # then restart the event-watcher Deployment.
           # See platform/services/cluster-dashboard/PLATFORM-HEALTH-AGENT.md.
           - name: cluster-dashboard
             namespace: ai-platform
